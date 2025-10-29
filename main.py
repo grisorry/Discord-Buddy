@@ -1476,15 +1476,13 @@ class RequestQueue:
             reply_to_name = request.get('reply_to_name')
             
             async with message.channel.typing():
-                # LOAD CHANNEL HISTORY IF NEEDED (for non-autonomous channels or when mentioned)
-                # This ensures the bot has context even when not participating autonomously
+                # LOAD CHANNEL HISTORY FROM DISCORD
+                # Always load fresh history for server channels to ensure full context
                 guild_id = guild.id if guild else None
-                is_autonomous = guild_id and autonomous_manager.should_respond_autonomously(guild_id, channel_id)
                 
-                # Load history from Discord if:
-                # 1. Not in DM (DMs use full history feature separately)
-                # 2. Not in autonomous mode (bot needs to catch up on conversations it wasn't tracking)
-                if not is_dm and not is_autonomous:
+                # Load history from Discord for all server channels (not DMs)
+                # This ensures the bot always has the complete conversation context
+                if not is_dm:
                     await load_channel_history_from_discord(message.channel, guild, channel_id)
                 
                 # Add the user's message to history
