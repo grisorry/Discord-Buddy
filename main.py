@@ -1482,8 +1482,9 @@ class RequestQueue:
                 
                 # Load history from Discord for all server channels (not DMs)
                 # This ensures the bot always has the complete conversation context
+                # Pass the triggering message so it can be excluded from the history load
                 if not is_dm:
-                    await load_channel_history_from_discord(message.channel, guild, channel_id)
+                    await load_channel_history_from_discord(message.channel, guild, channel_id, exclude_message_id=message.id)
                 
                 # Add the user's message to history
                 await add_to_history(channel_id, "user", content, user_id, guild.id if guild else None, attachments, user_name, reply_to=reply_to_name)
@@ -2810,7 +2811,7 @@ async def add_to_history(channel_id: int, role: str, content: str, user_id: int 
 
     return message_content
 
-async def load_channel_history_from_discord(channel: discord.TextChannel, guild: discord.Guild, channel_id: int):
+async def load_channel_history_from_discord(channel: discord.TextChannel, guild: discord.Guild, channel_id: int, exclude_message_id: int = None):
     """Load recent channel history from Discord for context when bot is mentioned in non-autonomous channels"""
     try:
         print(f"Loading channel history from Discord for channel {channel.name} (ID: {channel_id})...")
@@ -2824,7 +2825,11 @@ async def load_channel_history_from_discord(channel: discord.TextChannel, guild:
         
         # Collect recent messages (up to the limit)
         temp_messages = []
-        async for message in channel.history(limit=max_history_length):
+        async for message in channel.history(limit=max_history_length + 10):  # Fetch extra to account for filtering
+            # Skip the triggering message (it will be added separately with proper formatting)
+            if exclude_message_id and message.id == exclude_message_id:
+                continue
+                
             # Skip messages from this bot to avoid adding our own responses to history
             if message.author == client.user:
                 continue
@@ -2834,6 +2839,10 @@ async def load_channel_history_from_discord(channel: discord.TextChannel, guild:
                 continue
                 
             temp_messages.append(message)
+            
+            # Stop once we have enough messages
+            if len(temp_messages) >= max_history_length:
+                break
         
         # Reverse to get chronological order (oldest first)
         temp_messages.reverse()
@@ -3364,9 +3373,18 @@ async def generate_response(channel_id: int, user_message: str, guild: discord.G
                 message_content = await add_to_history(channel_id, "user", user_message, user_id, guild_id, attachments, user_name, reply_to=reply_to_name)
                 history = get_conversation_history(channel_id)
         else:
-            # Regular conversation history - ADD the user message first
-            message_content = await add_to_history(channel_id, "user", user_message, user_id, guild_id, attachments, user_name, reply_to=reply_to_name)
+            # For server channels, history is already loaded in _process_single_request
+            # Just get the existing history
             history = get_conversation_history(channel_id)
+            
+            # For DMs without full history, we still need to add the message
+            if is_dm:
+                message_content = await add_to_history(channel_id, "user", user_message, user_id, guild_id, attachments, user_name, reply_to=reply_to_name)
+                history = get_conversation_history(channel_id)
+            else:
+                # For server channels, the message was already added in _process_single_request
+                # Get the message content for potential replacement below
+                message_content = history[-1]["content"] if history and history[-1].get("role") == "user" else user_message
 
         # Create a COPY of the history for this response generation (don't modify the permanent history)
         history = history.copy()
