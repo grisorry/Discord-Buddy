@@ -1810,6 +1810,9 @@ def remove_thinking_tags(text: str) -> str:
     
     # Also remove self-closing thinking tags
     text = re.sub(r'<(\w*think\w*)[^>]*/>', '', text, flags=re.IGNORECASE)
+
+    # Also remove stray/orphan closing tags (e.g. </think>, </thinking>)
+    text = re.sub(r'</\w*think\w*>', '', text, flags=re.IGNORECASE)
     
     # Clean up extra whitespace
     text = re.sub(r'\n\s*\n', '\n\n', text)
