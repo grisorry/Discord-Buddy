@@ -1811,10 +1811,14 @@ def remove_thinking_tags(text: str) -> str:
     # Also remove self-closing thinking tags
     text = re.sub(r'<(\w*think\w*)[^>]*/>', '', text, flags=re.IGNORECASE)
     
+    # Also remove stray/orphan closing tags (e.g. </think>, </thinking>)
+    text = re.sub(r'.*?</\w*think\w*>', '', text, flags=re.DOTALL | re.IGNORECASE)
+    
     # Clean up extra whitespace
     text = re.sub(r'\n\s*\n', '\n\n', text)
     text = text.strip()
     
+    return text
     return text
 
 def clean_malformed_emojis(text: str, guild: discord.Guild = None) -> str:
