@@ -105,7 +105,7 @@ class AIProvider(ABC):
         self.api_key = api_key
     
     @abstractmethod
-    async def generate_response(self, messages: List[Dict], system_prompt: str, temperature: float = 1.0, model: str = None, max_tokens: int = 2000) -> str:
+    async def generate_response(self, messages: List[Dict], system_prompt: str, temperature: float = 1.0, model: str = None, max_tokens: int = 3000) -> str:
         pass
     
     @abstractmethod
@@ -128,7 +128,7 @@ class ClaudeProvider(AIProvider):
         if api_key:
             self.client = anthropic.Anthropic(api_key=api_key)
     
-    async def generate_response(self, messages: List[Dict], system_prompt: str, temperature: float = 1.0, model: str = None, max_tokens: int = 2000) -> str:
+    async def generate_response(self, messages: List[Dict], system_prompt: str, temperature: float = 1.0, model: str = None, max_tokens: int = 3000) -> str:
         if not self.api_key:
             return "❌ Claude API key not configured. Please contact the bot administrator."
         
@@ -189,7 +189,7 @@ class GeminiProvider(AIProvider):
         if api_key:
             self.client = genai.Client(api_key=api_key)
     
-    async def generate_response(self, messages: List[Dict], system_prompt: str, temperature: float = 1.0, model: str = None, max_output_tokens: int = 2000) -> str:
+    async def generate_response(self, messages: List[Dict], system_prompt: str, temperature: float = 1.0, model: str = None, max_output_tokens: int = 3000) -> str:
         if not self.api_key:
             return "❌ Gemini API key not configured. Please contact the bot administrator."
         
@@ -330,7 +330,7 @@ class OpenAIProvider(AIProvider):
         if api_key:
             self.client = AsyncOpenAI(api_key=api_key)
     
-    async def generate_response(self, messages: List[Dict], system_prompt: str, temperature: float = 1.0, model: str = None, max_tokens: int = 2000) -> str:
+    async def generate_response(self, messages: List[Dict], system_prompt: str, temperature: float = 1.0, model: str = None, max_tokens: int = 3000) -> str:
         if not self.api_key:
             return "❌ OpenAI API key not configured. Please contact the bot administrator."
         
@@ -593,7 +593,7 @@ class CustomProvider(AIProvider):
                 return True
             return False
     
-    async def generate_response(self, messages: List[Dict], system_prompt: str, temperature: float = 1.0, model: str = None, max_tokens: int = 2000) -> str:
+    async def generate_response(self, messages: List[Dict], system_prompt: str, temperature: float = 1.0, model: str = None, max_tokens: int = 3000) -> str:
         if not self.api_key:
             return "❌ Custom API key not configured. Please contact the bot administrator."
         
@@ -787,7 +787,7 @@ class AIProviderManager:
     
     async def generate_response(self, messages: List[Dict], system_prompt: str, 
                             temperature: float = 1.0, user_id: int = None, 
-                            guild_id: int = None, is_dm: bool = False, max_tokens: int = 2000) -> str:
+                            guild_id: int = None, is_dm: bool = False, max_tokens: int = 3000) -> str:
         """Generate response using appropriate provider"""
         
         # For DMs, check if user has selected a specific server, otherwise use shared guild
@@ -3747,7 +3747,7 @@ IMPORTANT: The bot is {current_persona}, not "AI Assistant" or "the bot".</instr
             guild_id=temp_guild_id,
             is_dm=not bool(guild),
             user_id=user_id,
-            max_tokens=2000
+            max_tokens=3000
         )
         
         # Check if response is None or error
@@ -5576,8 +5576,8 @@ async def create_personality(interaction: discord.Interaction, name: str, displa
         await interaction.followup.send("Display name must be between 2 and 64 characters.")
         return
     
-    if not (10 <= len(personality_prompt) <= 2000):
-        await interaction.followup.send("Personality prompt must be between 10 and 2000 characters.")
+    if not (10 <= len(personality_prompt) <= 3000):
+        await interaction.followup.send("Personality prompt must be between 10 and 3000 characters.")
         return
     
     clean_name = name.lower().replace(" ", "_")
@@ -5747,8 +5747,8 @@ async def edit_personality(interaction: discord.Interaction, personality_name: s
         updated_fields.append(f"Display name → {display_name}")
     
     if personality_prompt is not None:
-        if not (10 <= len(personality_prompt) <= 2000):
-            await interaction.followup.send("Personality prompt must be between 10 and 2000 characters.")
+        if not (10 <= len(personality_prompt) <= 3000):
+            await interaction.followup.send("Personality prompt must be between 10 and 3000 characters.")
             return
         custom_personalities[interaction.guild.id][clean_name]["prompt"] = personality_prompt
         prompt_preview = personality_prompt[:50] + ('...' if len(personality_prompt) > 50 else '')
