@@ -4141,6 +4141,7 @@ You can mention a specific user by including <@user_id> in your response, but on
                 print(f"[{i+1}] {role.upper()}: {display_content}")
             print("="*80)
 
+        request_start = time.perf_counter()
         bot_response = await ai_manager.generate_response(
             messages=history,
             system_prompt=system_prompt,
@@ -4150,6 +4151,7 @@ You can mention a specific user by including <@user_id> in your response, but on
             is_dm=is_dm,
             reasoning=reasoning_payload
         )
+        request_ms = int((time.perf_counter() - request_start) * 1000)
 
         # ========== RESPONSE DEBUG LOGGING ==========
         if not is_dm:
@@ -4157,6 +4159,7 @@ You can mention a specific user by including <@user_id> in your response, but on
             print("-" * 40)
             if bot_response:
                 print(f"✅ Response received ({len(bot_response)} chars)")
+                print(f"🧠 Reasoning: {'on' if reasoning_enabled else 'off'} | Duration: {request_ms} ms")
                 # Token usage (if provider supplies it)
                 if last_token_usage["input"] is not None or last_token_usage["output"] is not None or last_token_usage["total"] is not None:
                     print(f"🔢 Tokens used (provider): input={last_token_usage['input']}, output={last_token_usage['output']}, total={last_token_usage['total']}")
