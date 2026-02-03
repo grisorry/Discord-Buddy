@@ -27,6 +27,8 @@ from collections import defaultdict
 import time
 import logging
 import warnings
+import importlib.util
+import sys
 
 # Suppress warnings BEFORE importing pydub
 warnings.filterwarnings("ignore", message="Couldn't find ffmpeg or avconv - defaulting to ffmpeg, but may not work", category=RuntimeWarning)
@@ -65,6 +67,7 @@ tree = app_commands.CommandTree(client)
 # Data persistence paths
 DATA_DIR = "bot_data"
 os.makedirs(DATA_DIR, exist_ok=True)
+PLUGINS_DIR = "plugins"
 
 # Remove/replace existing prompt-related file paths and variables
 
@@ -92,6 +95,7 @@ NSFW_SETTINGS_FILE = os.path.join(DATA_DIR, "nsfw_settings.json")
 DM_NSFW_SETTINGS_FILE = os.path.join(DATA_DIR, "dm_nsfw_settings.json")
 CUSTOM_FORMAT_INSTRUCTIONS_FILE = os.path.join(DATA_DIR, "custom_format_instructions.json")
 PREFILL_SETTINGS_FILE = os.path.join(DATA_DIR, "prefill_settings.json")
+SUMMARY_FILE = os.path.join(DATA_DIR, "summaries.json")
 
 # Files for old prompt system - TO BE REMOVED
 CUSTOM_PROMPTS_FILE = os.path.join(DATA_DIR, "custom_prompts.json")
@@ -105,7 +109,7 @@ class AIProvider(ABC):
         self.api_key = api_key
     
     @abstractmethod
-    async def generate_response(self, messages: List[Dict], system_prompt: str, temperature: float = 1.0, model: str = None, max_tokens: int = 3000) -> str:
+    async def generate_response(self, messages: List[Dict], system_prompt: str, temperature: float = 1.0, model: str = None, max_tokens: int = 8192) -> str:
         pass
     
     @abstractmethod
@@ -128,7 +132,7 @@ class ClaudeProvider(AIProvider):
         if api_key:
             self.client = anthropic.Anthropic(api_key=api_key)
     
-    async def generate_response(self, messages: List[Dict], system_prompt: str, temperature: float = 1.0, model: str = None, max_tokens: int = 3000) -> str:
+    async def generate_response(self, messages: List[Dict], system_prompt: str, temperature: float = 1.0, model: str = None, max_tokens: int = 8192) -> str:
         if not self.api_key:
             return "❌ Claude API key not configured. Please contact the bot administrator."
         
@@ -189,7 +193,7 @@ class GeminiProvider(AIProvider):
         if api_key:
             self.client = genai.Client(api_key=api_key)
     
-    async def generate_response(self, messages: List[Dict], system_prompt: str, temperature: float = 1.0, model: str = None, max_output_tokens: int = 3000) -> str:
+    async def generate_response(self, messages: List[Dict], system_prompt: str, temperature: float = 1.0, model: str = None, max_output_tokens: int = 8192) -> str:
         if not self.api_key:
             return "❌ Gemini API key not configured. Please contact the bot administrator."
         
@@ -330,7 +334,7 @@ class OpenAIProvider(AIProvider):
         if api_key:
             self.client = AsyncOpenAI(api_key=api_key)
     
-    async def generate_response(self, messages: List[Dict], system_prompt: str, temperature: float = 1.0, model: str = None, max_tokens: int = 3000) -> str:
+    async def generate_response(self, messages: List[Dict], system_prompt: str, temperature: float = 1.0, model: str = None, max_tokens: int = 8192) -> str:
         if not self.api_key:
             return "❌ OpenAI API key not configured. Please contact the bot administrator."
         
@@ -593,7 +597,7 @@ class CustomProvider(AIProvider):
                 return True
             return False
     
-    async def generate_response(self, messages: List[Dict], system_prompt: str, temperature: float = 1.0, model: str = None, max_tokens: int = 3000) -> str:
+    async def generate_response(self, messages: List[Dict], system_prompt: str, temperature: float = 1.0, model: str = None, max_tokens: int = 8192) -> str:
         if not self.api_key:
             return "❌ Custom API key not configured. Please contact the bot administrator."
         
@@ -785,9 +789,9 @@ class AIProviderManager:
         
         return self.custom_provider_cache[custom_url]
     
-    async def generate_response(self, messages: List[Dict], system_prompt: str, 
-                            temperature: float = 1.0, user_id: int = None, 
-                            guild_id: int = None, is_dm: bool = False, max_tokens: int = 3000) -> str:
+    async def generate_response(self, messages: List[Dict], system_prompt: str,
+                            temperature: float = 1.0, user_id: int = None,
+                            guild_id: int = None, is_dm: bool = False, max_tokens: int = 8192) -> str:
         """Generate response using appropriate provider"""
         
         # For DMs, check if user has selected a specific server, otherwise use shared guild
@@ -1730,6 +1734,66 @@ def load_json_data(file_path: str, convert_keys=True) -> dict:
         pass
     return {}
 
+loaded_plugins: Dict[str, str] = {}
+plugin_errors: Dict[str, str] = {}
+
+async def load_plugins():
+    """Load plugins from the plugins directory."""
+    os.makedirs(PLUGINS_DIR, exist_ok=True)
+    loaded_plugins.clear()
+    plugin_errors.clear()
+    
+    for filename in os.listdir(PLUGINS_DIR):
+        if not filename.endswith(".py") or filename.startswith("_"):
+            continue
+        
+        module_name = os.path.splitext(filename)[0]
+        module_path = os.path.join(PLUGINS_DIR, filename)
+        full_module_name = f"plugins.{module_name}"
+        
+        try:
+            spec = importlib.util.spec_from_file_location(full_module_name, module_path)
+            if spec is None or spec.loader is None:
+                plugin_errors[module_name] = "Failed to load module spec"
+                continue
+            
+            module = importlib.util.module_from_spec(spec)
+            sys.modules[full_module_name] = module
+            spec.loader.exec_module(module)
+            
+            if hasattr(module, "register"):
+                result = module.register(tree, client)
+                if asyncio.iscoroutine(result):
+                    await result
+            elif hasattr(module, "setup"):
+                result = module.setup(tree, client)
+                if asyncio.iscoroutine(result):
+                    await result
+            else:
+                plugin_errors[module_name] = "No register(tree, client) or setup(tree, client) function found"
+                continue
+            
+            loaded_plugins[module_name] = module_path
+        except Exception as e:
+            plugin_errors[module_name] = str(e)
+
+def format_duration(seconds: float) -> str:
+    """Format seconds into a human-readable duration."""
+    seconds = int(seconds)
+    days, remainder = divmod(seconds, 86400)
+    hours, remainder = divmod(remainder, 3600)
+    minutes, secs = divmod(remainder, 60)
+    
+    parts = []
+    if days:
+        parts.append(f"{days}d")
+    if hours:
+        parts.append(f"{hours}h")
+    if minutes:
+        parts.append(f"{minutes}m")
+    parts.append(f"{secs}s")
+    return " ".join(parts)
+
 def save_personalities():
     """Save personality settings to file"""
     save_data = {
@@ -1965,6 +2029,10 @@ def load_custom_prompts():
 
 # Global state variables
 conversations: Dict[int, List[Dict]] = {}
+conversation_summaries: Dict[int, str] = load_json_data(SUMMARY_FILE)
+summary_last_updated: Dict[int, float] = {}
+summary_locks: Dict[int, asyncio.Lock] = defaultdict(asyncio.Lock)
+bot_start_time = time.time()
 
 def clean_conversation_history():
     """Clean any complex content (with base64 images) from conversation history, keeping only text"""
@@ -1980,6 +2048,113 @@ def clean_conversation_history():
                     elif isinstance(part, str):
                         text_parts.append(part)
                 message["content"] = " ".join(text_parts).strip()
+
+def save_conversation_summaries():
+    """Persist conversation summaries to file"""
+    save_json_data(SUMMARY_FILE, conversation_summaries)
+
+def format_history_for_summary(messages: List[Dict], guild_id: int = None, user_id: int = None, is_dm: bool = False) -> str:
+    """Format messages for summarization."""
+    if not messages:
+        return ""
+    
+    bot_name = get_bot_persona_name(guild_id, user_id, is_dm)
+    formatted = []
+    
+    for msg in messages:
+        role = msg.get("role")
+        content = msg.get("content", "")
+        
+        if isinstance(content, list):
+            text_parts = []
+            for part in content:
+                if isinstance(part, dict) and part.get("type") == "text":
+                    text_parts.append(part.get("text", ""))
+                elif isinstance(part, str):
+                    text_parts.append(part)
+            content = " ".join(text_parts).strip()
+        
+        if not isinstance(content, str) or not content.strip():
+            continue
+        
+        if role == "assistant":
+            formatted.append(f"{bot_name}: {content}")
+        else:
+            if is_dm and user_id:
+                user = client.get_user(user_id)
+                user_display = user.display_name if user and hasattr(user, 'display_name') else (user.name if user else "User")
+                formatted.append(f"{user_display}: {content}")
+            else:
+                formatted.append(content)
+    
+    return "\n".join(formatted)
+
+async def maybe_summarize_and_trim(channel_id: int, max_history: int, guild_id: int = None, user_id: int = None, is_dm: bool = False):
+    """Summarize overflow history and trim to max_history."""
+    if channel_id not in conversations:
+        return
+    
+    history = conversations[channel_id]
+    if len(history) <= max_history:
+        return
+    
+    # Prevent rapid repeat summarization
+    now = time.time()
+    last_updated = summary_last_updated.get(channel_id, 0)
+    if now - last_updated < 60:
+        conversations[channel_id] = history[-max_history:]
+        return
+    
+    excess = len(history) - max_history
+    if excess < 4:
+        conversations[channel_id] = history[-max_history:]
+        return
+    
+    async with summary_locks[channel_id]:
+        # Re-check after lock
+        history = conversations[channel_id]
+        if len(history) <= max_history:
+            return
+        
+        excess = len(history) - max_history
+        if excess < 4:
+            conversations[channel_id] = history[-max_history:]
+            return
+        
+        to_summarize = history[:excess]
+        summary_input = format_history_for_summary(to_summarize, guild_id, user_id, is_dm)
+        
+        if not summary_input.strip():
+            conversations[channel_id] = history[-max_history:]
+            return
+        
+        existing_summary = conversation_summaries.get(channel_id, "")
+        summary_prompt = """You are summarizing earlier parts of a Discord conversation.
+Update the summary so it includes the new information without losing prior important context.
+Keep it concise, factual, and useful for future responses.
+Use 3-6 short bullet points. Avoid quoting verbatim."""
+        
+        user_content = f"Existing summary (if any):\n{existing_summary}\n\nNew messages to summarize:\n{summary_input}"
+        
+        try:
+            summary_response = await ai_manager.generate_response(
+                messages=[{"role": "user", "content": user_content}],
+                system_prompt=summary_prompt,
+                temperature=0.4,
+                guild_id=guild_id,
+                is_dm=is_dm,
+                user_id=user_id,
+                max_tokens=700
+            )
+            
+            if summary_response and not summary_response.startswith("âŒ"):
+                conversation_summaries[channel_id] = summary_response.strip()
+                save_conversation_summaries()
+                summary_last_updated[channel_id] = now
+        except Exception as e:
+            print(f"Summary generation failed: {e}")
+        
+        conversations[channel_id] = history[-max_history:]
 
 # Clean conversation history on startup
 clean_conversation_history()
@@ -2811,7 +2986,7 @@ async def add_to_history(channel_id: int, role: str, content: str, user_id: int 
         max_history = get_history_length(guild_id) if guild_id else 50
 
     if len(conversations[channel_id]) > max_history:
-        conversations[channel_id] = conversations[channel_id][-max_history:]
+        await maybe_summarize_and_trim(channel_id, max_history, guild_id, user_id, is_dm)
 
     return message_content
 
@@ -3292,6 +3467,11 @@ Here is the conversation history (between the users and you):
     system_prompt = system_prompt.replace("{emoji_list}", emoji_list)
     system_prompt = system_prompt.replace("{memory}", memory_content)
 
+    # Add conversation summary if available
+    summary_text = conversation_summaries.get(channel_id) if channel_id else ""
+    if summary_text:
+        system_prompt += f"\n\nHere is a summary of earlier conversation:\n<summary>\n{summary_text}\n</summary>"
+
     return system_prompt
 
 def get_personality_name(guild_id: int) -> str:
@@ -3747,7 +3927,7 @@ IMPORTANT: The bot is {current_persona}, not "AI Assistant" or "the bot".</instr
             guild_id=temp_guild_id,
             is_dm=not bool(guild),
             user_id=user_id,
-            max_tokens=3000
+            max_tokens=8192
         )
         
         # Check if response is None or error
@@ -4038,6 +4218,12 @@ async def on_ready():
     # Start the background task for DM check-ups
     asyncio.create_task(check_up_task())
     
+    # Load plugins before syncing commands
+    try:
+        await load_plugins()
+    except Exception as e:
+        print(f"Plugin loading failed: {e}")
+
     await tree.sync()
     print("Bot is ready!")
 
@@ -4972,6 +5158,94 @@ async def set_temperature(interaction: discord.Interaction, temperature: float):
 
 # HELP COMMANDS
 
+@tree.command(name="health", description="Show bot health diagnostics")
+async def health_command(interaction: discord.Interaction):
+    """Show basic health and status information"""
+    await interaction.response.defer(ephemeral=True)
+    
+    uptime = format_duration(time.time() - bot_start_time)
+    latency_ms = int(client.latency * 1000)
+    guild_count = len(client.guilds)
+    channel_id = interaction.channel.id if interaction.channel else None
+    summary_status = "Yes" if (channel_id and conversation_summaries.get(channel_id)) else "No"
+    summary_count = len(conversation_summaries)
+    loaded_count = len(loaded_plugins)
+    error_count = len(plugin_errors)
+    
+    embed = discord.Embed(
+        title="🤖 Bot Health",
+        color=0x00ff99
+    )
+    
+    embed.add_field(name="Uptime", value=uptime, inline=True)
+    embed.add_field(name="Latency", value=f"{latency_ms} ms", inline=True)
+    embed.add_field(name="Guilds", value=str(guild_count), inline=True)
+    embed.add_field(name="Summaries", value=f"{summary_count} stored (current: {summary_status})", inline=False)
+    embed.add_field(name="Plugins", value=f"{loaded_count} loaded, {error_count} errors", inline=False)
+    
+    await interaction.followup.send(embed=embed)
+
+@tree.command(name="providers", description="Show AI provider status and current model")
+async def providers_command(interaction: discord.Interaction):
+    """Show provider availability and current model selection"""
+    await interaction.response.defer(ephemeral=True)
+    
+    providers_status = ai_manager.get_available_providers()
+    provider_lines = []
+    for provider, available in providers_status.items():
+        status = "✅" if available else "❌"
+        provider_lines.append(f"{status} {provider}")
+    
+    # Current provider for this context
+    current_provider = "unknown"
+    current_model = "unknown"
+    try:
+        if interaction.guild:
+            current_provider, current_model = ai_manager.get_guild_settings(interaction.guild.id)
+        elif interaction.user:
+            selected_guild_id = dm_server_selection.get(interaction.user.id)
+            if selected_guild_id:
+                current_provider, current_model = ai_manager.get_guild_settings(selected_guild_id)
+            else:
+                shared = get_shared_guild(interaction.user.id)
+                if shared:
+                    current_provider, current_model = ai_manager.get_guild_settings(shared.id)
+    except Exception:
+        pass
+    
+    embed = discord.Embed(
+        title="🧠 Provider Status",
+        color=0x00ccff
+    )
+    embed.add_field(name="Available Providers", value="\n".join(provider_lines) if provider_lines else "None", inline=False)
+    embed.add_field(name="Current Selection", value=f"{current_provider} / {current_model}", inline=False)
+    
+    await interaction.followup.send(embed=embed)
+
+@tree.command(name="queue", description="Show current request queue status (Admin only)")
+async def queue_command(interaction: discord.Interaction):
+    """Show queue stats"""
+    await interaction.response.defer(ephemeral=True)
+    
+    if interaction.guild and not check_admin_permissions(interaction):
+        await interaction.followup.send("❌ Administrator permissions required for `/queue`.")
+        return
+    
+    total_pending = sum(len(v) for v in request_queue.queues.values())
+    channel_id = interaction.channel.id if interaction.channel else None
+    channel_pending = len(request_queue.queues.get(channel_id, [])) if channel_id else 0
+    processing = request_queue.processing.get(channel_id, False) if channel_id else False
+    
+    embed = discord.Embed(
+        title="📬 Queue Status",
+        color=0xffcc00
+    )
+    embed.add_field(name="Total Pending", value=str(total_pending), inline=True)
+    embed.add_field(name="This Channel Pending", value=str(channel_pending), inline=True)
+    embed.add_field(name="Processing This Channel", value="Yes" if processing else "No", inline=True)
+    
+    await interaction.followup.send(embed=embed)
+
 @tree.command(name="help", description="Show all available commands and how to use the bot")
 async def help_command(interaction: discord.Interaction):
     """Display comprehensive help information"""
@@ -5024,6 +5298,14 @@ async def help_command(interaction: discord.Interaction):
             "`/delete_messages <number>` - Delete bot's last N messages\n"
             "`/add_prefill <text>` - Add a prefill message for conversations\n"
             "`/clear_prefill` - Remove the prefill message",
+        inline=False
+    )
+
+    embed.add_field(
+        name="🩺 Diagnostics",
+        value="`/health` - Bot health and uptime\n"
+            "`/providers` - AI provider status and current model\n"
+            "`/queue` - Request queue status (Admin only)",
         inline=False
     )
 
@@ -5576,8 +5858,8 @@ async def create_personality(interaction: discord.Interaction, name: str, displa
         await interaction.followup.send("Display name must be between 2 and 64 characters.")
         return
     
-    if not (10 <= len(personality_prompt) <= 3000):
-        await interaction.followup.send("Personality prompt must be between 10 and 3000 characters.")
+    if not (10 <= len(personality_prompt) <= 8192):
+        await interaction.followup.send("Personality prompt must be between 10 and 8192 characters.")
         return
     
     clean_name = name.lower().replace(" ", "_")
@@ -5747,8 +6029,8 @@ async def edit_personality(interaction: discord.Interaction, personality_name: s
         updated_fields.append(f"Display name → {display_name}")
     
     if personality_prompt is not None:
-        if not (10 <= len(personality_prompt) <= 3000):
-            await interaction.followup.send("Personality prompt must be between 10 and 3000 characters.")
+        if not (10 <= len(personality_prompt) <= 8192):
+            await interaction.followup.send("Personality prompt must be between 10 and 8192 characters.")
             return
         custom_personalities[interaction.guild.id][clean_name]["prompt"] = personality_prompt
         prompt_preview = personality_prompt[:50] + ('...' if len(personality_prompt) > 50 else '')
