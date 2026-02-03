@@ -399,6 +399,51 @@ class CommandsCog(commands.Cog):
                                        f"💡 *Lower values = more consistent, higher values = more creative*\n"
                                        f"🔒 *This setting also applies to DMs with server members*")
 
+    @app_commands.command(name="reasoning_toggle", description="Toggle reasoning mode (Admin only in servers)")
+    async def reasoning_toggle(self, interaction: discord.Interaction, enabled: bool = None):
+        """Toggle reasoning mode for this context"""
+        await interaction.response.defer(ephemeral=True)
+
+        is_dm = isinstance(interaction.channel, discord.DMChannel)
+
+        if not is_dm and not check_admin_permissions(interaction):
+            await interaction.followup.send("❌ Only administrators can use this command in servers!")
+            return
+
+        if enabled is None:
+            current = is_reasoning_enabled(interaction.guild.id if interaction.guild else None, interaction.user.id if interaction.user else None, is_dm)
+            await interaction.followup.send(f"Reasoning is currently {'enabled' if current else 'disabled'} for this {'DM' if is_dm else 'server'}.\nUse `/reasoning_toggle true` or `/reasoning_toggle false`.")
+            return
+
+        if is_dm:
+            dm_reasoning_settings[interaction.user.id] = enabled
+            save_json_data(DM_REASONING_SETTINGS_FILE, dm_reasoning_settings)
+            await interaction.followup.send(f"✅ Reasoning {'enabled' if enabled else 'disabled'} for your DMs.")
+        else:
+            guild_reasoning_settings[interaction.guild.id] = enabled
+            save_json_data(REASONING_SETTINGS_FILE, guild_reasoning_settings)
+            await interaction.followup.send(f"✅ Reasoning {'enabled' if enabled else 'disabled'} for this server.")
+
+    @app_commands.command(name="sync", description="Sync slash commands (Admin only in servers)")
+    async def sync_commands(self, interaction: discord.Interaction):
+        """Manually sync slash commands for this server"""
+        await interaction.response.defer(ephemeral=True)
+
+        if not interaction.guild:
+            await interaction.followup.send("Sync can only be used in servers, not DMs.")
+            return
+
+        if not check_admin_permissions(interaction):
+            await interaction.followup.send("❌ Only administrators can use this command!")
+            return
+
+        try:
+            await self.bot.tree.sync()
+            await self.bot.tree.sync(guild=interaction.guild)
+            await interaction.followup.send("✅ Slash commands synced for this server.")
+        except Exception as e:
+            await interaction.followup.send(f"❌ Sync failed: {e}")
+
     # HELP COMMANDS
 
     @app_commands.command(name="health", description="Show bot health diagnostics")
@@ -472,7 +517,7 @@ class CommandsCog(commands.Cog):
     
         embed.add_field(
             name="🤖 AI Model Commands",
-            value="`/model_set <provider> [model]` - Set AI provider and model (Admin only)\n`/model_info` - Show current model settings\n`/temperature_set <value>` - Set AI creativity (Admin only)\n`/dm_server_select [server]` - Choose which server's settings to use in DMs",
+            value="`/model_set <provider> [model]` - Set AI provider and model (Admin only)\n`/model_info` - Show current model settings\n`/temperature_set <value>` - Set AI creativity (Admin only)\n`/reasoning_toggle [true/false]` - Toggle reasoning (Admin only)\n`/dm_server_select [server]` - Choose which server's settings to use in DMs",
             inline=False
         )
     
@@ -2414,8 +2459,10 @@ class CommandsCog(commands.Cog):
             selected_guild_id = dm_server_selection.get(interaction.user.id)
             if selected_guild_id:
                 info_lines.append(f"DM server selection: {selected_guild_id}")
+            info_lines.append(f"Reasoning enabled: {is_reasoning_enabled(None, interaction.user.id, True)}")
         else:
             info_lines.append(f"History length setting: {get_history_length(interaction.guild.id)}")
+            info_lines.append(f"Reasoning enabled: {is_reasoning_enabled(interaction.guild.id, None, False)}")
 
         info_lines.append(f"Stored history entries: {len(history)}")
         if summary_text:
