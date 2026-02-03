@@ -29,6 +29,13 @@ import logging
 import warnings
 import importlib.util
 import sys
+from discord_buddy.providers.openrouter import (
+    post_openrouter_json,
+    extract_openrouter_usage,
+    extract_openrouter_generation_id,
+    extract_responses_output_text,
+    extract_chat_output_text,
+)
 
 # Suppress warnings BEFORE importing pydub
 warnings.filterwarnings("ignore", message="Couldn't find ffmpeg or avconv - defaulting to ffmpeg, but may not work", category=RuntimeWarning)
@@ -98,6 +105,8 @@ DM_NSFW_SETTINGS_FILE = os.path.join(DATA_DIR, "dm_nsfw_settings.json")
 CUSTOM_FORMAT_INSTRUCTIONS_FILE = os.path.join(DATA_DIR, "custom_format_instructions.json")
 PREFILL_SETTINGS_FILE = os.path.join(DATA_DIR, "prefill_settings.json")
 SUMMARY_FILE = os.path.join(DATA_DIR, "summaries.json")
+REASONING_SETTINGS_FILE = os.path.join(DATA_DIR, "reasoning_settings.json")
+DM_REASONING_SETTINGS_FILE = os.path.join(DATA_DIR, "dm_reasoning_settings.json")
 
 # Files for old prompt system - TO BE REMOVED
 CUSTOM_PROMPTS_FILE = os.path.join(DATA_DIR, "custom_prompts.json")
@@ -111,10 +120,104 @@ class AIProvider(ABC):
         self.api_key = api_key
     
     @abstractmethod
-    async def generate_response(self, messages: List[Dict], system_prompt: str, temperature: float = 1.0, model: str = None, max_tokens: int = 8192) -> str:
-        pass
-    
-    @abstractmethod
+    async def generate_response(self, messages: List[Dict], system_prompt: str, temperature: float = 1.0, model: str = None, max_tokens: int = 8192, reasoning: Optional[dict] = None) -> str:
+        if not self.api_key:
+            return "? OpenAI API key not configured. Please contact the bot administrator."
+        
+        try:
+            model = model or self.get_default_model()
+            
+            # Convert messages to OpenAI format
+            formatted_messages = [{"role": "system", "content": system_prompt}]
+            
+            for msg in messages:
+                role = msg["role"]
+                content = msg["content"]
+                
+                if isinstance(content, list):
+                    # Complex content with text and images
+                    openai_content = []
+                    for part in content:
+                        if isinstance(part, dict):
+                            if part.get("type") == "text":
+                                openai_content.append({
+                                    "type": "text",
+                                    "text": part["text"]
+                                })
+                            elif part.get("type") == "image_url":
+                                # Already in OpenAI format
+                                openai_content.append(part)
+                            elif part.get("type") == "image":
+                                # Convert from other formats (shouldn't happen, but just in case)
+                                if "data" in part and "media_type" in part:
+                                    openai_content.append({
+                                        "type": "image_url",
+                                        "image_url": {
+                                            "url": f"data:{part['media_type']};base64,{part['data']}",
+                                            "detail": "high"
+                                        }
+                                    })
+                    
+                    if openai_content:
+                        formatted_messages.append({"role": role, "content": openai_content})
+                
+                elif isinstance(content, str) and content.strip():
+                    # Simple text content
+                    formatted_messages.append({"role": role, "content": content})
+            
+            # Check if model supports vision
+            vision_models = ["gpt-5", "gpt-5-chat-latest", "gpt-4o", "gpt-4o-mini", "gpt-4-turbo", "gpt-4-vision-preview", "gpt-4.1", "gpt-4.1-mini"]
+            supports_vision = any(vision_model in model.lower() for vision_model in vision_models)
+            
+            # If model doesn't support vision but we have images, convert them to text descriptions
+            if not supports_vision:
+                for message in formatted_messages:
+                    if isinstance(message.get("content"), list):
+                        text_parts = []
+                        for part in message["content"]:
+                            if part.get("type") == "text":
+                                text_parts.append(part["text"])
+                            elif part.get("type") == "image_url":
+                                text_parts.append("[Image was provided but this model doesn't support vision]")
+                        message["content"] = " ".join(text_parts)
+            
+            response = await self.client.chat.completions.create(
+                model=model,
+                messages=formatted_messages,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                stream=False
+            )
+            
+            response_text = response.choices[0].message.content
+            
+            # Capture token usage if available
+            try:
+                if hasattr(response, "usage") and response.usage:
+                    update_last_token_usage(
+                        input_tokens=getattr(response.usage, "prompt_tokens", None),
+                        output_tokens=getattr(response.usage, "completion_tokens", None),
+                        total_tokens=getattr(response.usage, "total_tokens", None)
+                    )
+            except Exception:
+                pass
+            
+            # Check if the response contains proxy or API errors
+            if any(error_indicator in response_text.lower() for error_indicator in [
+                "proxy error", "upstream connect error", "connection termination", 
+                "service unavailable", "context size limit", "request validation failed",
+                "tokens.*exceeds", "http 503", "http 400", "http 429", "rate limit", "timeout"
+            ]):
+                return f"? OpenAI API error: {response_text}"
+            
+            # Clean any base64 data from the response
+            response_text = re.sub(r'data:image/[^;]+;base64,[A-Za-z0-9+/=]{50,}', '[IMAGE DATA REMOVED]', response_text)
+            response_text = re.sub(r'[A-Za-z0-9+/=]{100,}', '[BASE64 DATA REMOVED]', response_text)
+            
+            return response_text
+        
+        except Exception as e:
+            return f"? OpenAI API error: {str(e)}"
     def get_available_models(self) -> List[str]:
         pass
     
@@ -134,7 +237,7 @@ class ClaudeProvider(AIProvider):
         if api_key:
             self.client = anthropic.Anthropic(api_key=api_key)
     
-    async def generate_response(self, messages: List[Dict], system_prompt: str, temperature: float = 1.0, model: str = None, max_tokens: int = 8192) -> str:
+    async def generate_response(self, messages: List[Dict], system_prompt: str, temperature: float = 1.0, model: str = None, max_tokens: int = 8192, reasoning: Optional[dict] = None) -> str:
         if not self.api_key:
             return "❌ Claude API key not configured. Please contact the bot administrator."
         
@@ -204,7 +307,7 @@ class GeminiProvider(AIProvider):
         if api_key:
             self.client = genai.Client(api_key=api_key)
     
-    async def generate_response(self, messages: List[Dict], system_prompt: str, temperature: float = 1.0, model: str = None, max_output_tokens: int = 8192) -> str:
+    async def generate_response(self, messages: List[Dict], system_prompt: str, temperature: float = 1.0, model: str = None, max_output_tokens: int = 8192, reasoning: Optional[dict] = None) -> str:
         if not self.api_key:
             return "❌ Gemini API key not configured. Please contact the bot administrator."
         
@@ -356,9 +459,9 @@ class OpenAIProvider(AIProvider):
         if api_key:
             self.client = AsyncOpenAI(api_key=api_key)
     
-    async def generate_response(self, messages: List[Dict], system_prompt: str, temperature: float = 1.0, model: str = None, max_tokens: int = 8192) -> str:
+    async def generate_response(self, messages: List[Dict], system_prompt: str, temperature: float = 1.0, model: str = None, max_tokens: int = 8192, reasoning: Optional[dict] = None) -> str:
         if not self.api_key:
-            return "❌ OpenAI API key not configured. Please contact the bot administrator."
+            return "? OpenAI API key not configured. Please contact the bot administrator."
         
         try:
             model = model or self.get_default_model()
@@ -426,22 +529,7 @@ class OpenAIProvider(AIProvider):
             )
             
             response_text = response.choices[0].message.content
-            # Capture token usage if available
-            try:
-                if hasattr(response, "usage") and response.usage:
-                    update_last_token_usage(
-                        input_tokens=getattr(response.usage, "prompt_tokens", None),
-                        output_tokens=getattr(response.usage, "completion_tokens", None),
-                        total_tokens=getattr(response.usage, "total_tokens", None)
-                    )
-            except Exception:
-                pass
-            # If using OpenRouter, fetch accurate token usage
-            try:
-                if "openrouter.ai" in self.base_url.lower() and hasattr(response, "id") and response.id:
-                    await fetch_openrouter_generation_usage(response.id)
-            except Exception:
-                pass
+            
             # Capture token usage if available
             try:
                 if hasattr(response, "usage") and response.usage:
@@ -459,17 +547,16 @@ class OpenAIProvider(AIProvider):
                 "service unavailable", "context size limit", "request validation failed",
                 "tokens.*exceeds", "http 503", "http 400", "http 429", "rate limit", "timeout"
             ]):
-                return f"❌ OpenAI API error: {response_text}"
+                return f"? OpenAI API error: {response_text}"
             
             # Clean any base64 data from the response
             response_text = re.sub(r'data:image/[^;]+;base64,[A-Za-z0-9+/=]{50,}', '[IMAGE DATA REMOVED]', response_text)
-            response_text = re.sub(r'\b[A-Za-z0-9+/=]{100,}\b', '[BASE64 DATA REMOVED]', response_text)
+            response_text = re.sub(r'[A-Za-z0-9+/=]{100,}', '[BASE64 DATA REMOVED]', response_text)
             
             return response_text
-            
+        
         except Exception as e:
-            return f"❌ OpenAI API error: {str(e)}"
-    
+            return f"? OpenAI API error: {str(e)}"
     def get_available_models(self) -> List[str]:
         return [
             "gpt-5",             # Vision support
@@ -645,9 +732,9 @@ class CustomProvider(AIProvider):
                 return True
             return False
     
-    async def generate_response(self, messages: List[Dict], system_prompt: str, temperature: float = 1.0, model: str = None, max_tokens: int = 8192) -> str:
+    async def generate_response(self, messages: List[Dict], system_prompt: str, temperature: float = 1.0, model: str = None, max_tokens: int = 8192, reasoning: Optional[dict] = None) -> str:
         if not self.api_key:
-            return "❌ Custom API key not configured. Please contact the bot administrator."
+            return "? Custom API key not configured. Please contact the bot administrator."
         
         try:
             model = model or self.get_default_model()
@@ -705,7 +792,6 @@ class CustomProvider(AIProvider):
             if has_images:
                 supports_vision = await self.supports_vision_dynamic(model)
                 if not supports_vision:
-                    # print(f"Converting images to text for {model} (no vision support)")
                     # Convert images to text descriptions
                     for message in formatted_messages:
                         if isinstance(message.get("content"), list):
@@ -716,34 +802,144 @@ class CustomProvider(AIProvider):
                                 elif part.get("type") == "image_url":
                                     text_parts.append("[Image was provided but this model doesn't support vision!]")
                             message["content"] = " ".join(text_parts)
-            
-            response = await self.client.chat.completions.create(
-                model=model,
-                messages=formatted_messages,
-                temperature=temperature,
-                max_tokens=max_tokens,
-                stream=False
-            )
-            
-            response_text = response.choices[0].message.content
-            
+
+            response_text = ""
+
+            def flatten_content(value):
+                if isinstance(value, list):
+                    parts = []
+                    for part in value:
+                        if isinstance(part, dict):
+                            if part.get("type") == "text":
+                                parts.append(part.get("text", ""))
+                            elif part.get("type") in ["image_url", "image"]:
+                                parts.append("[Image]")
+                        elif isinstance(part, str):
+                            parts.append(part)
+                    return " ".join([p for p in parts if p]).strip()
+                return str(value).strip()
+
+            # OpenRouter Responses API when reasoning is enabled
+            if "openrouter.ai" in self.base_url.lower() and reasoning:
+                try:
+                    convo_lines = []
+                    for msg in messages:
+                        role = msg.get("role", "user")
+                        content = flatten_content(msg.get("content", ""))
+                        convo_lines.append(f"{role}: {content}")
+                    input_text = system_prompt.strip() + "\n\nConversation:\n" + "\n".join(convo_lines)
+
+                    payload = {
+                        "model": model,
+                        "input": input_text,
+                        "reasoning": reasoning,
+                        "max_output_tokens": max_tokens,
+                        "temperature": temperature
+                    }
+                    data, headers = await post_openrouter_json(self.base_url, self.api_key, "/responses", payload, timeout=60)
+                    if isinstance(data, dict):
+                        usage = extract_openrouter_usage(data)
+                        input_tokens = None
+                        output_tokens = None
+                        total_tokens = None
+                        if isinstance(usage, dict):
+                            input_tokens = coerce_int(usage.get("input_tokens"))
+                            if input_tokens is None:
+                                input_tokens = coerce_int(usage.get("prompt_tokens"))
+                            output_tokens = coerce_int(usage.get("output_tokens"))
+                            if output_tokens is None:
+                                output_tokens = coerce_int(usage.get("completion_tokens"))
+                            total_tokens = coerce_int(usage.get("total_tokens"))
+
+                        has_usage = input_tokens is not None or output_tokens is not None or total_tokens is not None
+                        if has_usage:
+                            update_last_token_usage(
+                                input_tokens=input_tokens,
+                                output_tokens=output_tokens,
+                                total_tokens=total_tokens
+                            )
+
+                        response_text = extract_responses_output_text(data)
+
+                        generation_id = extract_openrouter_generation_id(data, headers)
+                        if generation_id and not has_usage:
+                            await fetch_openrouter_generation_usage(str(generation_id), retries=5, delay_s=0.5)
+                except Exception:
+                    response_text = ""
+
+            # Fallback to Chat Completions
+            if not response_text:
+                if "openrouter.ai" in self.base_url.lower():
+                    payload = {
+                        "model": model,
+                        "messages": formatted_messages,
+                        "temperature": temperature,
+                        "max_tokens": max_tokens,
+                        "stream": False
+                    }
+                    data, headers = await post_openrouter_json(self.base_url, self.api_key, "/chat/completions", payload, timeout=60)
+                    if isinstance(data, dict):
+                        response_text = extract_chat_output_text(data)
+                        usage = extract_openrouter_usage(data)
+
+                        input_tokens = None
+                        output_tokens = None
+                        total_tokens = None
+                        if isinstance(usage, dict):
+                            input_tokens = coerce_int(usage.get("input_tokens"))
+                            if input_tokens is None:
+                                input_tokens = coerce_int(usage.get("prompt_tokens"))
+                            output_tokens = coerce_int(usage.get("output_tokens"))
+                            if output_tokens is None:
+                                output_tokens = coerce_int(usage.get("completion_tokens"))
+                            total_tokens = coerce_int(usage.get("total_tokens"))
+
+                        has_usage = input_tokens is not None or output_tokens is not None or total_tokens is not None
+                        if has_usage:
+                            update_last_token_usage(
+                                input_tokens=input_tokens,
+                                output_tokens=output_tokens,
+                                total_tokens=total_tokens
+                            )
+                        generation_id = extract_openrouter_generation_id(data, headers)
+                        if generation_id and not has_usage:
+                            await fetch_openrouter_generation_usage(str(generation_id), retries=5, delay_s=0.5)
+                else:
+                    response = await self.client.chat.completions.create(
+                        model=model,
+                        messages=formatted_messages,
+                        temperature=temperature,
+                        max_tokens=max_tokens,
+                        stream=False
+                    )
+                    response_text = response.choices[0].message.content
+                    # Capture token usage if available
+                    try:
+                        if hasattr(response, "usage") and response.usage:
+                            update_last_token_usage(
+                                input_tokens=getattr(response.usage, "prompt_tokens", None),
+                                output_tokens=getattr(response.usage, "completion_tokens", None),
+                                total_tokens=getattr(response.usage, "total_tokens", None)
+                            )
+                    except Exception:
+                        pass
+
             # Check if the response contains proxy or API errors
             if any(error_indicator in response_text.lower() for error_indicator in [
                 "proxy error", "upstream connect error", "connection termination", 
                 "service unavailable", "context size limit", "request validation failed",
                 "tokens.*exceeds", "http 503", "http 400", "http 429", "rate limit", "timeout"
             ]):
-                return f"❌ Custom API error: {response_text}"
+                return f"? Custom API error: {response_text}"
             
             # Clean any base64 data from the response
             response_text = re.sub(r'data:image/[^;]+;base64,[A-Za-z0-9+/=]{50,}', '[IMAGE DATA REMOVED]', response_text)
-            response_text = re.sub(r'\b[A-Za-z0-9+/=]{100,}\b', '[BASE64 DATA REMOVED]', response_text)
+            response_text = re.sub(r'[A-Za-z0-9+/=]{100,}', '[BASE64 DATA REMOVED]', response_text)
             
             return response_text
         
         except Exception as e:
-            return f"❌ Custom API error: {str(e)}"
-    
+            return f"? Custom API error: {str(e)}"
     def get_available_models(self) -> List[str]:
         return [
             "auto-detect",
@@ -839,7 +1035,8 @@ class AIProviderManager:
     
     async def generate_response(self, messages: List[Dict], system_prompt: str,
                             temperature: float = 1.0, user_id: int = None,
-                            guild_id: int = None, is_dm: bool = False, max_tokens: int = 8192) -> str:
+                            guild_id: int = None, is_dm: bool = False, max_tokens: int = 8192,
+                            reasoning: Optional[dict] = None) -> str:
         """Generate response using appropriate provider"""
         
         # For DMs, check if user has selected a specific server, otherwise use shared guild
@@ -883,11 +1080,11 @@ class AIProviderManager:
                 custom_url = self.get_guild_custom_url(url_guild_id)
                 # Use cached provider instance instead of creating new one
                 custom_provider = self.get_custom_provider(custom_url)
-                return await custom_provider.generate_response(messages, system_prompt, temperature, model_name, max_tokens)
+                return await custom_provider.generate_response(messages, system_prompt, temperature, model_name, max_tokens, reasoning)
             else:
                 # Use default custom provider
                 provider = self.providers.get(provider_name)
-                return await provider.generate_response(messages, system_prompt, temperature, model_name, max_tokens)
+                return await provider.generate_response(messages, system_prompt, temperature, model_name, max_tokens, reasoning)
         
         # Handle other providers normally
         provider = self.providers.get(provider_name)
@@ -895,7 +1092,7 @@ class AIProviderManager:
             # No fallback - just return error
             return "❌ No AI providers are available. Please contact the bot administrator to configure API keys."
         
-        return await provider.generate_response(messages, system_prompt, temperature, model_name, max_tokens)
+        return await provider.generate_response(messages, system_prompt, temperature, model_name, max_tokens, reasoning)
     
     def save_settings(self):
         """Save provider settings to files"""
@@ -2238,6 +2435,8 @@ dm_format_settings: Dict[int, str] = load_json_data(DM_FORMAT_SETTINGS_FILE)
 server_format_defaults: Dict[int, str] = load_json_data(SERVER_FORMAT_DEFAULTS_FILE)
 guild_nsfw_settings: Dict[int, bool] = load_json_data(NSFW_SETTINGS_FILE)
 dm_nsfw_settings: Dict[int, bool] = load_json_data(DM_NSFW_SETTINGS_FILE)
+guild_reasoning_settings: Dict[int, bool] = load_json_data(REASONING_SETTINGS_FILE)
+dm_reasoning_settings: Dict[int, bool] = load_json_data(DM_REASONING_SETTINGS_FILE)
 custom_format_instructions: Dict[str, str] = load_json_data(CUSTOM_FORMAT_INSTRUCTIONS_FILE, convert_keys=False)
 prefill_settings: Dict[int, str] = load_json_data(PREFILL_SETTINGS_FILE)
 multipart_responses: Dict[int, Dict[int, Tuple[List[int], str]]] = {}
@@ -2255,6 +2454,15 @@ bot_persona_name: str = "Assistant"
 recently_deleted_dm_messages: Dict[int, Set[int]] = {}
 last_token_usage: Dict[str, Optional[int]] = {"input": None, "output": None, "total": None}
 
+def coerce_int(value: Optional[object]) -> Optional[int]:
+    """Best-effort conversion to int for token usage values."""
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
 def update_last_token_usage(input_tokens: Optional[int] = None, output_tokens: Optional[int] = None, total_tokens: Optional[int] = None):
     """Update the last known token usage values."""
     if input_tokens is not None:
@@ -2266,10 +2474,22 @@ def update_last_token_usage(input_tokens: Optional[int] = None, output_tokens: O
     if last_token_usage["total"] is None and last_token_usage["input"] is not None and last_token_usage["output"] is not None:
         last_token_usage["total"] = last_token_usage["input"] + last_token_usage["output"]
 
-async def fetch_openrouter_generation_usage(generation_id: str) -> None:
+def reset_last_token_usage():
+    """Reset token usage tracking for the next request."""
+    last_token_usage["input"] = None
+    last_token_usage["output"] = None
+    last_token_usage["total"] = None
+
+async def fetch_openrouter_generation_usage(generation_id: str, retries: int = 3, delay_s: float = 0.5) -> None:
     """Fetch OpenRouter generation stats for accurate token usage."""
     if not generation_id or not CUSTOM_API_KEY:
         return
+    generation_id = str(generation_id)
+    is_gen_id = generation_id.startswith("gen-")
+    if not is_gen_id:
+        # Avoid long waits for non-generation IDs, but still try once.
+        retries = 1
+        delay_s = 0
     url = f"https://openrouter.ai/api/v1/generation?id={generation_id}"
     headers = {
         "Authorization": f"Bearer {CUSTOM_API_KEY}",
@@ -2277,21 +2497,30 @@ async def fetch_openrouter_generation_usage(generation_id: str) -> None:
     }
     try:
         async with aiohttp.ClientSession() as session:
-            async with session.get(url, headers=headers, timeout=10) as resp:
-                if resp.status != 200:
-                    return
-                data = await resp.json()
-                payload = data.get("data") or data.get("generation") or {}
-                native_in = payload.get("native_tokens_prompt")
-                native_out = payload.get("native_tokens_completion")
-                if native_in is not None or native_out is not None:
-                    update_last_token_usage(input_tokens=native_in, output_tokens=native_out)
-                    return
-                # Fallback to non-native tokens if present
-                tok_in = payload.get("tokens_prompt")
-                tok_out = payload.get("tokens_completion")
-                if tok_in is not None or tok_out is not None:
-                    update_last_token_usage(input_tokens=tok_in, output_tokens=tok_out)
+            for attempt in range(retries):
+                async with session.get(url, headers=headers, timeout=10) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        payload = data.get("data") or data.get("generation") or {}
+                        native_in = coerce_int(payload.get("native_tokens_prompt"))
+                        native_out = coerce_int(payload.get("native_tokens_completion"))
+                        if native_in is not None or native_out is not None:
+                            update_last_token_usage(input_tokens=native_in, output_tokens=native_out)
+                            return
+                        # Fallback to non-native tokens if present
+                        tok_in = coerce_int(payload.get("tokens_prompt"))
+                        tok_out = coerce_int(payload.get("tokens_completion"))
+                        if tok_in is not None or tok_out is not None:
+                            update_last_token_usage(input_tokens=tok_in, output_tokens=tok_out)
+                            return
+                    elif resp.status in (404, 202):
+                        # Generation stats may not be ready yet
+                        if not is_gen_id:
+                            return
+                        await asyncio.sleep(delay_s)
+                        continue
+                    else:
+                        return
     except Exception:
         return
 
@@ -2362,6 +2591,14 @@ def update_bot_persona_name(guild_id: int = None, user_id: int = None, is_dm: bo
     """Update the global bot persona name based on current context"""
     global bot_persona_name
     bot_persona_name = get_bot_persona_name(guild_id, user_id, is_dm)
+
+def is_reasoning_enabled(guild_id: int = None, user_id: int = None, is_dm: bool = False) -> bool:
+    """Check if reasoning mode is enabled for this context."""
+    if is_dm and user_id:
+        return dm_reasoning_settings.get(user_id, False)
+    if guild_id:
+        return guild_reasoning_settings.get(guild_id, False)
+    return False
 
 def get_guild_emojis(guild: discord.Guild) -> str:
     """Get formatted list of guild emojis for system prompt with simple :name: format"""
@@ -3773,7 +4010,12 @@ async def generate_response(channel_id: int, user_message: str, guild: discord.G
         elif guild_id:
             temperature = get_temperature(guild_id)
 
+        # Reasoning mode (OpenRouter responses API when enabled)
+        reasoning_enabled = is_reasoning_enabled(guild_id, user_id, is_dm)
+        reasoning_payload = {"effort": "high"} if reasoning_enabled else None
+
         # Generate response using AI Provider Manager
+        reset_last_token_usage()
         # Check message size before sending to prevent 413 errors
         estimated_size = estimate_message_size(history, system_prompt)
         max_safe_size = 800000  # ~800K characters, well below most API limits
@@ -3864,6 +4106,7 @@ You can mention a specific user by including <@user_id> in your response, but on
             print(f"📊 Model Provider: {debug_provider}")
             print(f"🎯 Model: {debug_model}")
             print(f"🌡️  Temperature: {temperature}")
+            print(f"🧠 Reasoning: {'on' if reasoning_enabled else 'off'}")
             
             print("\n🎯 SYSTEM PROMPT:")
             print("-" * 40)
@@ -3904,7 +4147,8 @@ You can mention a specific user by including <@user_id> in your response, but on
             temperature=temperature,
             user_id=user_id,
             guild_id=guild_id,
-            is_dm=is_dm
+            is_dm=is_dm,
+            reasoning=reasoning_payload
         )
 
         # ========== RESPONSE DEBUG LOGGING ==========
