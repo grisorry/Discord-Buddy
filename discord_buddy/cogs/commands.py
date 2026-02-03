@@ -2422,6 +2422,13 @@ class CommandsCog(commands.Cog):
             info_lines.append(f"Summary stored: Yes ({min(len(summary_text), 500)} chars)")
         else:
             info_lines.append("Summary stored: No")
+        # Recent reaction micro-memory
+        reactions = get_recent_reaction_memory(channel_id)
+        if reactions:
+            last_reaction = reactions[-1]
+            info_lines.append(f"Recent reactions stored: {len(reactions)} (latest: {last_reaction.get('reaction')})")
+        else:
+            info_lines.append("Recent reactions stored: 0")
 
         header = "\n".join(info_lines)
 
@@ -2454,8 +2461,16 @@ class CommandsCog(commands.Cog):
 
         history_block = "\n".join(lines) if lines else "No stored history for this channel."
 
+        # Reactions block (expanded)
+        reactions_block = "None."
+        if reactions:
+            reaction_lines = []
+            for idx, r in enumerate(reactions, start=1):
+                reaction_lines.append(f"{idx}. {r.get('reaction')} to <@{r.get('user_id')}>")
+            reactions_block = "\n".join(reaction_lines)
+
         # Chunk output to avoid message limits
-        full_text = f"**History Debug**\n{header}\n\n**Recent {len(recent)} entries**\n{history_block}"
+        full_text = f"**History Debug**\n{header}\n\n**Recent {len(recent)} entries**\n{history_block}\n\n**Recent Reactions**\n{reactions_block}"
         if len(full_text) <= 1900:
             await interaction.followup.send(full_text)
         else:
@@ -2469,6 +2484,7 @@ class CommandsCog(commands.Cog):
                 chunk += (line + "\n")
             if chunk:
                 await interaction.followup.send(chunk)
+            await interaction.followup.send(f"**Recent Reactions**\n{reactions_block}")
 
     # FUN COMMANDS
 
