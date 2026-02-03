@@ -45,6 +45,11 @@ class EventsCog(commands.Cog):
             print(f"Plugin loading failed: {e}")
 
         await self.bot.tree.sync()
+        for guild in self.bot.guilds:
+            try:
+                await self.bot.tree.sync(guild=guild)
+            except Exception as e:
+                print(f"Guild sync failed for {guild.id}: {e}")
         print("Bot is ready!")
 
     @commands.Cog.listener()
