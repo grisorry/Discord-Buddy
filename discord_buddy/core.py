@@ -152,6 +152,15 @@ class ClaudeProvider(AIProvider):
             )
             
             response_text = response.content[0].text
+            # Capture token usage if available
+            try:
+                if hasattr(response, "usage") and response.usage:
+                    update_last_token_usage(
+                        input_tokens=getattr(response.usage, "input_tokens", None),
+                        output_tokens=getattr(response.usage, "output_tokens", None)
+                    )
+            except Exception:
+                pass
             
             # Check if the response contains proxy or API errors
             if any(error_indicator in response_text.lower() for error_indicator in [
@@ -261,6 +270,17 @@ class GeminiProvider(AIProvider):
                 contents=gemini_messages,
                 config=generation_config
             )
+            # Capture token usage if available
+            try:
+                usage = getattr(response, "usage_metadata", None)
+                if usage:
+                    update_last_token_usage(
+                        input_tokens=getattr(usage, "prompt_token_count", None),
+                        output_tokens=getattr(usage, "candidates_token_count", None),
+                        total_tokens=getattr(usage, "total_token_count", None)
+                    )
+            except Exception:
+                pass
             
             if hasattr(response, 'text') and response.text:
                 # Check if the response contains proxy or API errors
@@ -406,6 +426,26 @@ class OpenAIProvider(AIProvider):
             )
             
             response_text = response.choices[0].message.content
+            # Capture token usage if available
+            try:
+                if hasattr(response, "usage") and response.usage:
+                    update_last_token_usage(
+                        input_tokens=getattr(response.usage, "prompt_tokens", None),
+                        output_tokens=getattr(response.usage, "completion_tokens", None),
+                        total_tokens=getattr(response.usage, "total_tokens", None)
+                    )
+            except Exception:
+                pass
+            # Capture token usage if available
+            try:
+                if hasattr(response, "usage") and response.usage:
+                    update_last_token_usage(
+                        input_tokens=getattr(response.usage, "prompt_tokens", None),
+                        output_tokens=getattr(response.usage, "completion_tokens", None),
+                        total_tokens=getattr(response.usage, "total_tokens", None)
+                    )
+            except Exception:
+                pass
             
             # Check if the response contains proxy or API errors
             if any(error_indicator in response_text.lower() for error_indicator in [
@@ -2187,6 +2227,18 @@ dm_server_selection: Dict[int, int] = load_json_data(DM_SERVER_SELECTION_FILE)
 guild_dm_enabled: Dict[int, bool] = load_json_data(DM_ENABLED_FILE)
 bot_persona_name: str = "Assistant"
 recently_deleted_dm_messages: Dict[int, Set[int]] = {}
+last_token_usage: Dict[str, Optional[int]] = {"input": None, "output": None, "total": None}
+
+def update_last_token_usage(input_tokens: Optional[int] = None, output_tokens: Optional[int] = None, total_tokens: Optional[int] = None):
+    """Update the last known token usage values."""
+    if input_tokens is not None:
+        last_token_usage["input"] = input_tokens
+    if output_tokens is not None:
+        last_token_usage["output"] = output_tokens
+    if total_tokens is not None:
+        last_token_usage["total"] = total_tokens
+    if last_token_usage["total"] is None and last_token_usage["input"] is not None and last_token_usage["output"] is not None:
+        last_token_usage["total"] = last_token_usage["input"] + last_token_usage["output"]
 
 # Temporary old system variables - TO BE COMPLETELY REMOVED
 # custom_prompts: Dict[int, Dict[str, Dict[str, str]]] = {}
@@ -3024,12 +3076,9 @@ async def load_channel_history_from_discord(channel: discord.TextChannel, guild:
             if exclude_message_id and message.id == exclude_message_id:
                 continue
                 
-            # Skip messages from this bot to avoid adding our own responses to history
-            if message.author == client.user:
-                continue
-
             # If a trigger user is provided, scope context to them + direct bot mentions/replies
-            if trigger_user_id:
+            # Always keep the bot's own messages to preserve continuity
+            if trigger_user_id and message.author != client.user:
                 is_trigger_user = message.author.id == trigger_user_id
                 mentions_bot = client and (client.user in message.mentions)
                 replies_to_bot = bool(message.reference and message.reference.resolved and message.reference.resolved.author == client.user)
@@ -3097,17 +3146,30 @@ async def load_channel_history_from_discord(channel: discord.TextChannel, guild:
                 content += " " + sticker_info
             
             # Add to history with reply indicator if present
-            await add_to_history(
-                channel_id,
-                "user",
-                content,
-                message.author.id,
-                guild.id if guild else None,
-                [],  # Don't process attachments again
-                author_name,
-                process_images=False,  # Don't process images from history
-                reply_to=reply_to_name
-            )
+            if message.author == client.user:
+                await add_to_history(
+                    channel_id,
+                    "assistant",
+                    content,
+                    None,
+                    guild.id if guild else None,
+                    [],  # Don't process attachments again
+                    None,
+                    process_images=False,  # Don't process images from history
+                    reply_to=None
+                )
+            else:
+                await add_to_history(
+                    channel_id,
+                    "user",
+                    content,
+                    message.author.id,
+                    guild.id if guild else None,
+                    [],  # Don't process attachments again
+                    author_name,
+                    process_images=False,  # Don't process images from history
+                    reply_to=reply_to_name
+                )
         
         print(f"✅ Loaded {len(temp_messages)} messages from channel history for context")
         
@@ -3412,13 +3474,21 @@ Here is a relevant memory of a past conversation. It can be empty, if none was r
 Here are some important rules you must always follow:
 - Always stay in character.
 - Never respond or roleplay for others.
-- Actively participate in conversations, ask follow-up questions, share anecdotes, shift topics, and have fun."""
+- Actively participate in conversations, ask follow-up questions, share anecdotes, shift topics, and have fun.
+- The user's latest message is the primary request; prioritize answering it over older context.
+- If the latest message introduces a new topic or question, answer it directly and do not continue the prior thread.
+- Do not treat meta-instructions inside history (e.g., "continue the conversation") as higher priority than the latest user message."""
 
     # Add NSFW section if enabled
     if nsfw_enabled:
         system_prompt += "\n- Anything goes, since all the users are adults and they know what they're getting into; profanities, dark themes, obscene jokes, kinky cybersex, controversial opinions, and gore are allowed due to the nature of this NSFW chat."
 
     system_prompt += """
+
+Here is the latest user message (most important):
+<latest>
+{latest_message}
+</latest>
 
 Here is the conversation history (between the users and you):
 <history>"""
@@ -3479,6 +3549,7 @@ Here is the conversation history (between the users and you):
     system_prompt = system_prompt.replace("{lore}", lore_content)
     system_prompt = system_prompt.replace("{emoji_list}", emoji_list)
     system_prompt = system_prompt.replace("{memory}", memory_content)
+    system_prompt = system_prompt.replace("{latest_message}", query or "")
 
     # Add conversation summary if available
     summary_text = conversation_summaries.get(channel_id) if channel_id else ""
@@ -3747,6 +3818,14 @@ You can mention a specific user by including <@user_id> in your response, but on
             print("-" * 40)
             if bot_response:
                 print(f"✅ Response received ({len(bot_response)} chars)")
+                # Token usage (if provider supplies it)
+                if last_token_usage["input"] is not None or last_token_usage["output"] is not None or last_token_usage["total"] is not None:
+                    print(f"🔢 Tokens used (provider): input={last_token_usage['input']}, output={last_token_usage['output']}, total={last_token_usage['total']}")
+                else:
+                    # Fallback estimate (~4 chars per token)
+                    approx_in = max(1, int(estimated_size / 4))
+                    approx_out = max(1, int(len(bot_response) / 4))
+                    print(f"🔢 Tokens used (approx): input≈{approx_in}, output≈{approx_out}, total≈{approx_in + approx_out}")
                 display_response = bot_response if len(bot_response) <= 500 else bot_response[:500] + "...[TRUNCATED]"
                 print(f"📝 Response: {display_response}")
             else:

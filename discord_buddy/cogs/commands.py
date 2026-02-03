@@ -509,9 +509,9 @@ class CommandsCog(commands.Cog):
         )
 
         embed.add_field(
-            name="🩺 Diagnostics",
+            name="ðŸ©º Diagnostics",
             value="`/health` - Bot health and uptime\n"
-                ""
+                "`/debug_history` - Show stored history (Admin only)\n"
                 "`/queue` - Request queue status (Admin only)",
             inline=False
         )
@@ -2382,6 +2382,93 @@ class CommandsCog(commands.Cog):
             context = "DM" if is_dm else "channel"
             await interaction.followup.send(f"✅ **No {context} memory to clear!**\n"
                                            f"This {context} was already starting fresh.{dm_full_history_warning}")
+
+
+    @app_commands.command(name="debug_history", description="Show current stored history and context info (Admin only in servers)")
+    async def debug_history(self, interaction: discord.Interaction, limit: int = 12):
+        """Debug view of current conversation history and settings"""
+        await interaction.response.defer(ephemeral=True)
+
+        # Admin check for servers
+        if interaction.guild and not check_admin_permissions(interaction):
+            await interaction.followup.send("? Only administrators can use this command in servers.")
+            return
+
+        if not (1 <= limit <= 50):
+            await interaction.followup.send("Limit must be between 1 and 50.")
+            return
+
+        channel_id = interaction.channel.id
+        is_dm = isinstance(interaction.channel, discord.DMChannel)
+        history = get_conversation_history(channel_id)
+        summary_text = conversation_summaries.get(channel_id, "")
+
+        # Basic context info
+        info_lines = []
+        context_label = "DM" if is_dm else f"Server: {interaction.guild.name}"
+        info_lines.append(f"Context: {context_label}")
+
+        if is_dm:
+            dm_full_history = dm_manager.is_dm_full_history_enabled(interaction.user.id)
+            info_lines.append(f"DM full history enabled: {dm_full_history}")
+            selected_guild_id = dm_server_selection.get(interaction.user.id)
+            if selected_guild_id:
+                info_lines.append(f"DM server selection: {selected_guild_id}")
+        else:
+            info_lines.append(f"History length setting: {get_history_length(interaction.guild.id)}")
+
+        info_lines.append(f"Stored history entries: {len(history)}")
+        if summary_text:
+            info_lines.append(f"Summary stored: Yes ({min(len(summary_text), 500)} chars)")
+        else:
+            info_lines.append("Summary stored: No")
+
+        header = "\n".join(info_lines)
+
+        # Render recent history
+        lines = []
+        recent = history[-limit:] if history else []
+        for i, msg in enumerate(recent, start=max(1, len(history) - len(recent) + 1)):
+            role = msg.get("role", "unknown")
+            content = msg.get("content", "")
+            if isinstance(content, list):
+                content = "[non-text content]"
+            content = str(content).strip()
+            user_tag = ""
+            if role == "user" and msg.get("user_id"):
+                user_tag = f" <@{msg.get('user_id')}>"
+
+            # Expand grouped user messages for clarity
+            if role == "user" and "\n" in content:
+                parts = [p.strip() for p in content.split("\n") if p.strip()]
+                for idx, part in enumerate(parts, start=1):
+                    display = part
+                    if len(display) > 220:
+                        display = display[:220] + "..."
+                    lines.append(f"{i}.{idx} {role}{user_tag}: {display}")
+            else:
+                display = content.replace("\n", " / ")
+                if len(display) > 220:
+                    display = display[:220] + "..."
+                lines.append(f"{i}. {role}{user_tag}: {display}")
+
+        history_block = "\n".join(lines) if lines else "No stored history for this channel."
+
+        # Chunk output to avoid message limits
+        full_text = f"**History Debug**\n{header}\n\n**Recent {len(recent)} entries**\n{history_block}"
+        if len(full_text) <= 1900:
+            await interaction.followup.send(full_text)
+        else:
+            # Send header first, then chunk history
+            await interaction.followup.send(f"**History Debug**\n{header}\n\n**Recent {len(recent)} entries**")
+            chunk = ""
+            for line in lines:
+                if len(chunk) + len(line) + 1 > 1800:
+                    await interaction.followup.send(chunk)
+                    chunk = ""
+                chunk += (line + "\n")
+            if chunk:
+                await interaction.followup.send(chunk)
 
     # FUN COMMANDS
 
