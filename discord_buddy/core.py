@@ -1800,6 +1800,17 @@ class RequestQueue:
                 if message:
                     bot_response = await process_and_add_reactions(bot_response, message)
 
+                # If the response is only a reaction tag, keep a minimal text reply
+                # unless the user message is a command or emoji-only.
+                if bot_response is not None:
+                    cleaned = str(bot_response).strip()
+                    if not cleaned:
+                        user_text = str(content).strip() if content is not None else ""
+                        is_command_like = user_text.startswith("/")
+                        is_emoji_only = bool(user_text) and bool(re.fullmatch(r'[\s\W_]+', user_text))
+                        if not is_command_like and not is_emoji_only:
+                            bot_response = "Noted."
+
                 # THEN CLEAN EMOJIS (after reactions are processed)
                 if bot_response and guild:
                     bot_response = clean_malformed_emojis(bot_response, guild)
@@ -3985,6 +3996,9 @@ async def generate_response(channel_id: int, user_message: str, guild: discord.G
                 reply_to_name = replied_message.author.global_name
             else:
                 reply_to_name = replied_message.author.name
+
+        # Default message content fallback (will be replaced when add_to_history runs)
+        message_content = user_message
 
         if use_full_history:
             try:
