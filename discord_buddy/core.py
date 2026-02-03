@@ -107,6 +107,8 @@ PREFILL_SETTINGS_FILE = os.path.join(DATA_DIR, "prefill_settings.json")
 SUMMARY_FILE = os.path.join(DATA_DIR, "summaries.json")
 REASONING_SETTINGS_FILE = os.path.join(DATA_DIR, "reasoning_settings.json")
 DM_REASONING_SETTINGS_FILE = os.path.join(DATA_DIR, "dm_reasoning_settings.json")
+REASONING_EFFORT_FILE = os.path.join(DATA_DIR, "reasoning_effort.json")
+DM_REASONING_EFFORT_FILE = os.path.join(DATA_DIR, "dm_reasoning_effort.json")
 
 # Files for old prompt system - TO BE REMOVED
 CUSTOM_PROMPTS_FILE = os.path.join(DATA_DIR, "custom_prompts.json")
@@ -822,16 +824,33 @@ class CustomProvider(AIProvider):
             # OpenRouter Responses API when reasoning is enabled
             if "openrouter.ai" in self.base_url.lower() and reasoning:
                 try:
-                    convo_lines = []
+                    input_messages = []
+                    if system_prompt and system_prompt.strip():
+                        input_messages.append({
+                            "type": "message",
+                            "role": "system",
+                            "content": [
+                                {"type": "input_text", "text": system_prompt.strip()}
+                            ],
+                        })
+
                     for msg in messages:
                         role = msg.get("role", "user")
                         content = flatten_content(msg.get("content", ""))
-                        convo_lines.append(f"{role}: {content}")
-                    input_text = system_prompt.strip() + "\n\nConversation:\n" + "\n".join(convo_lines)
+                        if not content:
+                            continue
+                        content_type = "input_text" if role != "assistant" else "output_text"
+                        input_messages.append({
+                            "type": "message",
+                            "role": role if role in ["user", "assistant", "system"] else "user",
+                            "content": [
+                                {"type": content_type, "text": content}
+                            ],
+                        })
 
                     payload = {
                         "model": model,
-                        "input": input_text,
+                        "input": input_messages,
                         "reasoning": reasoning,
                         "max_output_tokens": max_tokens,
                         "temperature": temperature
@@ -2437,6 +2456,8 @@ guild_nsfw_settings: Dict[int, bool] = load_json_data(NSFW_SETTINGS_FILE)
 dm_nsfw_settings: Dict[int, bool] = load_json_data(DM_NSFW_SETTINGS_FILE)
 guild_reasoning_settings: Dict[int, bool] = load_json_data(REASONING_SETTINGS_FILE)
 dm_reasoning_settings: Dict[int, bool] = load_json_data(DM_REASONING_SETTINGS_FILE)
+guild_reasoning_effort: Dict[int, str] = load_json_data(REASONING_EFFORT_FILE)
+dm_reasoning_effort: Dict[int, str] = load_json_data(DM_REASONING_EFFORT_FILE)
 custom_format_instructions: Dict[str, str] = load_json_data(CUSTOM_FORMAT_INSTRUCTIONS_FILE, convert_keys=False)
 prefill_settings: Dict[int, str] = load_json_data(PREFILL_SETTINGS_FILE)
 multipart_responses: Dict[int, Dict[int, Tuple[List[int], str]]] = {}
@@ -2599,6 +2620,14 @@ def is_reasoning_enabled(guild_id: int = None, user_id: int = None, is_dm: bool 
     if guild_id:
         return guild_reasoning_settings.get(guild_id, False)
     return False
+
+def get_reasoning_effort(guild_id: int = None, user_id: int = None, is_dm: bool = False) -> str:
+    """Get reasoning effort level for this context."""
+    if is_dm and user_id:
+        return dm_reasoning_effort.get(user_id, "high")
+    if guild_id:
+        return guild_reasoning_effort.get(guild_id, "high")
+    return "high"
 
 def get_guild_emojis(guild: discord.Guild) -> str:
     """Get formatted list of guild emojis for system prompt with simple :name: format"""
@@ -4012,7 +4041,8 @@ async def generate_response(channel_id: int, user_message: str, guild: discord.G
 
         # Reasoning mode (OpenRouter responses API when enabled)
         reasoning_enabled = is_reasoning_enabled(guild_id, user_id, is_dm)
-        reasoning_payload = {"effort": "high"} if reasoning_enabled else None
+        reasoning_effort = get_reasoning_effort(guild_id, user_id, is_dm)
+        reasoning_payload = {"effort": reasoning_effort} if reasoning_enabled else None
 
         # Generate response using AI Provider Manager
         reset_last_token_usage()

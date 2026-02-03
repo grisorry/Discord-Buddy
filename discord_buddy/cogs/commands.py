@@ -424,6 +424,32 @@ class CommandsCog(commands.Cog):
             save_json_data(REASONING_SETTINGS_FILE, guild_reasoning_settings)
             await interaction.followup.send(f"✅ Reasoning {'enabled' if enabled else 'disabled'} for this server.")
 
+    @app_commands.command(name="reasoning_effort", description="Set reasoning effort (Admin only in servers)")
+    async def reasoning_effort(self, interaction: discord.Interaction, effort: str):
+        """Set reasoning effort for this context"""
+        await interaction.response.defer(ephemeral=True)
+
+        is_dm = isinstance(interaction.channel, discord.DMChannel)
+
+        if not is_dm and not check_admin_permissions(interaction):
+            await interaction.followup.send("❌ Only administrators can use this command in servers!")
+            return
+
+        effort = (effort or "").lower().strip()
+        allowed = {"minimal", "low", "medium", "high"}
+        if effort not in allowed:
+            await interaction.followup.send("Effort must be one of: minimal, low, medium, high.")
+            return
+
+        if is_dm:
+            dm_reasoning_effort[interaction.user.id] = effort
+            save_json_data(DM_REASONING_EFFORT_FILE, dm_reasoning_effort)
+            await interaction.followup.send(f"✅ Reasoning effort set to **{effort}** for your DMs.")
+        else:
+            guild_reasoning_effort[interaction.guild.id] = effort
+            save_json_data(REASONING_EFFORT_FILE, guild_reasoning_effort)
+            await interaction.followup.send(f"✅ Reasoning effort set to **{effort}** for this server.")
+
     @app_commands.command(name="sync", description="Sync slash commands (Admin only in servers)")
     async def sync_commands(self, interaction: discord.Interaction):
         """Manually sync slash commands for this server"""
@@ -517,7 +543,7 @@ class CommandsCog(commands.Cog):
     
         embed.add_field(
             name="🤖 AI Model Commands",
-            value="`/model_set <provider> [model]` - Set AI provider and model (Admin only)\n`/model_info` - Show current model settings\n`/temperature_set <value>` - Set AI creativity (Admin only)\n`/reasoning_toggle [true/false]` - Toggle reasoning (Admin only)\n`/dm_server_select [server]` - Choose which server's settings to use in DMs",
+            value="`/model_set <provider> [model]` - Set AI provider and model (Admin only)\n`/model_info` - Show current model settings\n`/temperature_set <value>` - Set AI creativity (Admin only)\n`/reasoning_toggle [true/false]` - Toggle reasoning (Admin only)\n`/reasoning_effort <minimal|low|medium|high>` - Set reasoning effort (Admin only)\n`/dm_server_select [server]` - Choose which server's settings to use in DMs",
             inline=False
         )
     
@@ -2460,9 +2486,11 @@ class CommandsCog(commands.Cog):
             if selected_guild_id:
                 info_lines.append(f"DM server selection: {selected_guild_id}")
             info_lines.append(f"Reasoning enabled: {is_reasoning_enabled(None, interaction.user.id, True)}")
+            info_lines.append(f"Reasoning effort: {get_reasoning_effort(None, interaction.user.id, True)}")
         else:
             info_lines.append(f"History length setting: {get_history_length(interaction.guild.id)}")
             info_lines.append(f"Reasoning enabled: {is_reasoning_enabled(interaction.guild.id, None, False)}")
+            info_lines.append(f"Reasoning effort: {get_reasoning_effort(interaction.guild.id, None, False)}")
 
         info_lines.append(f"Stored history entries: {len(history)}")
         if summary_text:
