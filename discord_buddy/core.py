@@ -436,6 +436,12 @@ class OpenAIProvider(AIProvider):
                     )
             except Exception:
                 pass
+            # If using OpenRouter, fetch accurate token usage
+            try:
+                if "openrouter.ai" in self.base_url.lower() and hasattr(response, "id") and response.id:
+                    await fetch_openrouter_generation_usage(response.id)
+            except Exception:
+                pass
             # Capture token usage if available
             try:
                 if hasattr(response, "usage") and response.usage:
@@ -2078,6 +2084,8 @@ def load_custom_prompts():
 # Global state variables
 conversations: Dict[int, List[Dict]] = {}
 conversation_summaries: Dict[int, str] = load_json_data(SUMMARY_FILE)
+# Recent reaction micro-memory per channel
+recent_reactions: Dict[int, List[Dict]] = {}
 summary_last_updated: Dict[int, float] = {}
 summary_locks: Dict[int, asyncio.Lock] = defaultdict(asyncio.Lock)
 bot_start_time = time.time()
@@ -2204,8 +2212,26 @@ Use 3-6 short bullet points. Avoid quoting verbatim."""
         
         conversations[channel_id] = history[-max_history:]
 
-# Clean conversation history on startup
+    # Clean conversation history on startup
 clean_conversation_history()
+
+def add_reaction_memory(channel_id: int, reacted_user_id: int, reaction_text: str):
+    """Store recent reaction actions as micro-memory (per channel)."""
+    now = time.time()
+    entry = {"user_id": reacted_user_id, "reaction": reaction_text, "timestamp": now}
+    entries = recent_reactions.get(channel_id, [])
+    entries.append(entry)
+    # Prune old entries (15 minutes)
+    cutoff = now - 900
+    entries = [e for e in entries if e["timestamp"] >= cutoff]
+    # Keep last 5
+    if len(entries) > 5:
+        entries = entries[-5:]
+    recent_reactions[channel_id] = entries
+
+def get_recent_reaction_memory(channel_id: int) -> List[Dict]:
+    """Get recent reaction micro-memories for a channel."""
+    return recent_reactions.get(channel_id, [])
 
 channel_format_settings: Dict[int, str] = load_json_data(FORMAT_SETTINGS_FILE)
 dm_format_settings: Dict[int, str] = load_json_data(DM_FORMAT_SETTINGS_FILE)
@@ -2239,6 +2265,35 @@ def update_last_token_usage(input_tokens: Optional[int] = None, output_tokens: O
         last_token_usage["total"] = total_tokens
     if last_token_usage["total"] is None and last_token_usage["input"] is not None and last_token_usage["output"] is not None:
         last_token_usage["total"] = last_token_usage["input"] + last_token_usage["output"]
+
+async def fetch_openrouter_generation_usage(generation_id: str) -> None:
+    """Fetch OpenRouter generation stats for accurate token usage."""
+    if not generation_id or not CUSTOM_API_KEY:
+        return
+    url = f"https://openrouter.ai/api/v1/generation?id={generation_id}"
+    headers = {
+        "Authorization": f"Bearer {CUSTOM_API_KEY}",
+        "Content-Type": "application/json"
+    }
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, headers=headers, timeout=10) as resp:
+                if resp.status != 200:
+                    return
+                data = await resp.json()
+                payload = data.get("data") or data.get("generation") or {}
+                native_in = payload.get("native_tokens_prompt")
+                native_out = payload.get("native_tokens_completion")
+                if native_in is not None or native_out is not None:
+                    update_last_token_usage(input_tokens=native_in, output_tokens=native_out)
+                    return
+                # Fallback to non-native tokens if present
+                tok_in = payload.get("tokens_prompt")
+                tok_out = payload.get("tokens_completion")
+                if tok_in is not None or tok_out is not None:
+                    update_last_token_usage(input_tokens=tok_in, output_tokens=tok_out)
+    except Exception:
+        return
 
 # Temporary old system variables - TO BE COMPLETELY REMOVED
 # custom_prompts: Dict[int, Dict[str, Dict[str, str]]] = {}
@@ -2429,6 +2484,7 @@ async def process_and_add_reactions(bot_response: str, user_message: discord.Mes
     # Find all reaction instructions in the response
     reaction_pattern = r'\[REACT:\s*([^\]]+)\]'
     reactions = re.findall(reaction_pattern, bot_response)
+    applied_reactions: List[str] = []
     
     # Remove reaction instructions from the response
     if reactions:
@@ -2453,6 +2509,12 @@ async def process_and_add_reactions(bot_response: str, user_message: discord.Mes
                 await user_message.add_reaction(converted_reaction)
                 # Small delay to avoid rate limiting
                 await asyncio.sleep(0.5)
+                # Store micro-memory for this reaction
+                try:
+                    add_reaction_memory(user_message.channel.id, user_message.author.id, reaction)
+                except Exception:
+                    pass
+                applied_reactions.append(reaction)
             except discord.HTTPException as e:
                 # If it still fails, just skip it
                 # print(f"Failed to add reaction '{reaction}': {e}")
@@ -2461,6 +2523,21 @@ async def process_and_add_reactions(bot_response: str, user_message: discord.Mes
                 print(f"Unexpected error adding reaction '{reaction}': {e}")
                 continue
     
+    # Persist a lightweight reaction note in history for continuity
+    if applied_reactions:
+        try:
+            target_name = user_message.author.display_name if hasattr(user_message.author, "display_name") else user_message.author.name
+            reaction_list = ", ".join(applied_reactions)
+            note = f"[Reacted to {target_name} with {reaction_list}]"
+            await add_to_history(
+                user_message.channel.id,
+                "assistant",
+                note,
+                guild_id=user_message.guild.id if user_message.guild else None
+            )
+        except Exception:
+            pass
+
     return cleaned_response
 
 def convert_emoji_for_reaction(emoji_text: str, guild: discord.Guild = None) -> str:
@@ -3471,6 +3548,11 @@ Here is a relevant memory of a past conversation. It can be empty, if none was r
 {memory}
 </memory>
 
+Here are your recent reaction actions (if any):
+<recent_reactions>
+{recent_reactions}
+</recent_reactions>
+
 Here are some important rules you must always follow:
 - Always stay in character.
 - Never respond or roleplay for others.
@@ -3545,10 +3627,23 @@ Here is the conversation history (between the users and you):
     if not lore_content:
         lore_content = "No specific lore available about the users."
 
+    # Add recent reactions
+    reactions = get_recent_reaction_memory(channel_id) if channel_id else []
+    if reactions:
+        reaction_lines = []
+        for r in reactions[-3:]:
+            user_id = r.get("user_id")
+            reaction = r.get("reaction")
+            reaction_lines.append(f"- Reacted with {reaction} to <@{user_id}>")
+        reactions_text = "\n".join(reaction_lines)
+    else:
+        reactions_text = "None."
+
     # Replace placeholders (no need for last_message placeholder anymore)
     system_prompt = system_prompt.replace("{lore}", lore_content)
     system_prompt = system_prompt.replace("{emoji_list}", emoji_list)
     system_prompt = system_prompt.replace("{memory}", memory_content)
+    system_prompt = system_prompt.replace("{recent_reactions}", reactions_text)
     system_prompt = system_prompt.replace("{latest_message}", query or "")
 
     # Add conversation summary if available
