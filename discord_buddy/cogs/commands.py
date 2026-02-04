@@ -1,3 +1,4 @@
+import os
 import discord
 from discord import app_commands
 from discord.ext import commands
@@ -450,6 +451,81 @@ class CommandsCog(commands.Cog):
             save_json_data(REASONING_EFFORT_FILE, guild_reasoning_effort)
             await interaction.followup.send(f"✅ Reasoning effort set to **{effort}** for this server.")
 
+    @app_commands.command(name="reasoning_stream_toggle", description="Toggle CLI reasoning stream (Admin only in servers)")
+    async def reasoning_stream_toggle(self, interaction: discord.Interaction, enabled: bool = None):
+        """Toggle CLI streaming indicator for reasoning runs"""
+        await interaction.response.defer(ephemeral=True)
+
+        is_dm = isinstance(interaction.channel, discord.DMChannel)
+
+        if not is_dm and not check_admin_permissions(interaction):
+            await interaction.followup.send("❌ Only administrators can use this command in servers!")
+            return
+
+        if enabled is None:
+            status = "enabled" if cli_reasoning_stream_enabled else "disabled"
+            await interaction.followup.send(f"CLI reasoning stream is currently **{status}**.\nUse `/reasoning_stream_toggle true` or `/reasoning_stream_toggle false`.")
+            return
+
+        set_cli_reasoning_stream_enabled(enabled)
+        await interaction.followup.send(f"✅ CLI reasoning stream {'enabled' if enabled else 'disabled'}.")
+
+
+    @app_commands.command(name="embeddings_toggle", description="Toggle embeddings for this context (Admin only in servers)")
+    async def embeddings_toggle(self, interaction: discord.Interaction, enabled: bool = None):
+        """Toggle embeddings usage for this context"""
+        await interaction.response.defer(ephemeral=True)
+
+        is_dm = isinstance(interaction.channel, discord.DMChannel)
+
+        if not is_dm and not check_admin_permissions(interaction):
+            await interaction.followup.send("❌ Only administrators can use this command in servers!")
+            return
+
+        if enabled is None:
+            current_enabled, current_model = get_effective_embedding_settings(
+                interaction.guild.id if interaction.guild else None,
+                interaction.user.id if interaction.user else None,
+                is_dm
+            )
+            source = "DM override" if is_dm and interaction.user.id in dm_embedding_settings else "server/default"
+            await interaction.followup.send(
+                f"Embeddings are currently **{'enabled' if current_enabled else 'disabled'}** ({source}).\n"
+                f"Model: `{current_model}`\n"
+                f"Use `/embeddings_toggle true` or `/embeddings_toggle false`."
+            )
+            return
+
+        if is_dm:
+            set_embedding_settings_for_dm(interaction.user.id, enabled=enabled)
+            await interaction.followup.send(f"✅ Embeddings {'enabled' if enabled else 'disabled'} for your DMs.")
+        else:
+            set_embedding_settings_for_guild(interaction.guild.id, enabled=enabled)
+            await interaction.followup.send(f"✅ Embeddings {'enabled' if enabled else 'disabled'} for this server.")
+
+    @app_commands.command(name="embeddings_model_set", description="Set the embeddings model (Admin only in servers)")
+    async def embeddings_model_set(self, interaction: discord.Interaction, model: str):
+        """Set embeddings model for this context"""
+        await interaction.response.defer(ephemeral=True)
+
+        is_dm = isinstance(interaction.channel, discord.DMChannel)
+
+        if not is_dm and not check_admin_permissions(interaction):
+            await interaction.followup.send("❌ Only administrators can use this command in servers!")
+            return
+
+        model = (model or "").strip()
+        if not model:
+            await interaction.followup.send("❌ Please provide a valid embeddings model id.")
+            return
+
+        if is_dm:
+            set_embedding_settings_for_dm(interaction.user.id, model=model)
+            await interaction.followup.send(f"✅ Embeddings model set to `{model}` for your DMs.")
+        else:
+            set_embedding_settings_for_guild(interaction.guild.id, model=model)
+            await interaction.followup.send(f"✅ Embeddings model set to `{model}` for this server.")
+
     @app_commands.command(name="sync", description="Sync slash commands (Admin only in servers)")
     async def sync_commands(self, interaction: discord.Interaction):
         """Manually sync slash commands for this server"""
@@ -543,13 +619,13 @@ class CommandsCog(commands.Cog):
     
         embed.add_field(
             name="🤖 AI Model Commands",
-            value="`/model_set <provider> [model]` - Set AI provider and model (Admin only)\n`/model_info` - Show current model settings\n`/temperature_set <value>` - Set AI creativity (Admin only)\n`/reasoning_toggle [true/false]` - Toggle reasoning (Admin only)\n`/reasoning_effort <minimal|low|medium|high>` - Set reasoning effort (Admin only)\n`/dm_server_select [server]` - Choose which server's settings to use in DMs",
+            value="`/model_set <provider> [model]` - Set AI provider and model (Admin only)\n`/model_info` - Show current model settings\n`/temperature_set <value>` - Set AI creativity (Admin only)\n`/reasoning_toggle [true/false]` - Toggle reasoning (Admin only)\n`/reasoning_effort <minimal|low|medium|high>` - Set reasoning effort (Admin only)\n`/reasoning_stream_toggle [true/false]` - Toggle CLI reasoning stream (Admin only in servers)\n`/embeddings_toggle [true/false]` - Toggle embeddings (Admin only in servers)\n`/embeddings_model_set <model>` - Set embeddings model (Admin only in servers)\n`/dm_server_select [server]` - Choose which server's settings to use in DMs",
             inline=False
         )
     
         embed.add_field(
             name="🎭 Personality Commands",
-            value="`/personality_create <name> <display_name> <prompt>` - Create custom personality for the bot (Admin only)\n`/personality_set [name]` - Set/view the bot's active personality (Admin only)\n`/personality_list` - List all personalities of the bot\n`/personality_edit <name> [display_name] [prompt]` - Edit personality (Admin only)\n`/personality_delete <name>` - Delete personality (Admin only)",
+            value="`/personality_create <name> <display_name> <prompt>` - Create custom personality for the bot (Admin only)\n`/personality_import <file> [name] [display_name]` - Import personality from .txt (Admin only)\n`/personality_lore_set <personality> [lore_text] [lore_file]` - Set character lore (Admin only)\n`/personality_set [name]` - Set/view the bot's active personality (Admin only)\n`/personality_list` - List all personalities of the bot\n`/personality_edit <name> [display_name] [prompt]` - Edit personality (Admin only)\n`/personality_delete <name>` - Delete personality (Admin only)",
             inline=False
         )
     
@@ -898,11 +974,11 @@ class CommandsCog(commands.Cog):
             else:
                 # Default instructions
                 if fmt_type == "conversational":
-                    format_instructions[fmt_type] = "Respond with up to one sentence, adapting internet language. You can reply with just one word or emoji, if you choose to. Avoid using asterisks and em-dashes. Do not repeat after yourself or others."
+                    format_instructions[fmt_type] = "Respond with up to one sentence, adapting internet language. You can reply with just one word or emoji, if you choose to. Avoid using asterisks and em-dashes. Do not repeat after yourself or others. If the user's message is unclear or very short, ask a brief clarifying question or invite detail instead of repeating. Avoid stock phrases or reusing distinctive lines from your persona."
                 elif fmt_type == "asterisk":
-                    format_instructions[fmt_type] = "Respond with one to three short paragraphs of asterisk roleplay. Enclose actions and descriptions in *asterisks*, while keeping dialogues as plain text. Avoid using em-dashes and nested asterisks; they break the formatting. Do not repeat after yourself or others. Be creative."
+                    format_instructions[fmt_type] = "Respond with one to three short paragraphs of asterisk roleplay. Enclose actions and descriptions in *asterisks*, while keeping dialogues as plain text. Avoid using em-dashes and nested asterisks; they break the formatting. Do not repeat after yourself or others. If the user's message is unclear or very short, ask a brief clarifying question or invite detail instead of repeating. Avoid stock phrases or reusing distinctive lines from your persona. Be creative."
                 elif fmt_type == "narrative":
-                    format_instructions[fmt_type] = "Respond with one to four short paragraphs of narrative roleplay. Use plain text for the narration and \"quotation marks\" for dialogues. Avoid using em-dashes and asterisks. Do not repeat after yourself or others. Be creative. Show, don't tell."
+                    format_instructions[fmt_type] = "Respond with one to four short paragraphs of narrative roleplay. Use plain text for the narration and \"quotation marks\" for dialogues. Avoid using em-dashes and asterisks. Do not repeat after yourself or others. If the user's message is unclear or very short, ask a brief clarifying question or invite detail instead of repeating. Avoid stock phrases or reusing distinctive lines from your persona. Be creative. Show, don't tell."
     
         embed = discord.Embed(
             title="📋 Format Instruction Templates",
@@ -1163,6 +1239,129 @@ class CommandsCog(commands.Cog):
         await interaction.followup.send(f"✅ Created personality **{display_name}** (`{clean_name}`)!\n"
                                        f"Use `/personality_set {clean_name}` to activate it.\n\n"
                                        f"**Prompt preview:** {prompt_preview}")
+
+    @app_commands.command(name="personality_import", description="Import a personality from a .txt file (Admin only)")
+    async def import_personality(self, interaction: discord.Interaction, file: discord.Attachment, name: str = None, display_name: str = None):
+        """Import a personality from a text file"""
+        await interaction.response.defer(ephemeral=True)
+
+        if not interaction.guild:
+            await interaction.followup.send("Personalities can only be imported in servers, not DMs.")
+            return
+
+        if not check_admin_permissions(interaction):
+            await interaction.followup.send("❌ Only administrators can import personalities!")
+            return
+
+        if not file or not file.filename.lower().endswith(".txt"):
+            await interaction.followup.send("❌ Please upload a valid .txt file.")
+            return
+
+        # Read file content
+        try:
+            raw_bytes = await file.read()
+            text = raw_bytes.decode("utf-8", errors="ignore").strip()
+        except Exception as e:
+            await interaction.followup.send(f"❌ Failed to read file: {str(e)}")
+            return
+
+        if not text:
+            await interaction.followup.send("❌ The file is empty.")
+            return
+
+        # Derive defaults from filename if not provided
+        filename_base = os.path.splitext(file.filename)[0]
+        derived_name = filename_base.lower().replace(" ", "_") if filename_base else "imported_personality"
+
+        if name is None or not name.strip():
+            name = derived_name
+        if display_name is None or not display_name.strip():
+            display_name = filename_base if filename_base else "Imported Personality"
+
+        # Validate input parameters
+        if not (2 <= len(name) <= 32):
+            await interaction.followup.send("Personality name must be between 2 and 32 characters.")
+            return
+
+        if not (2 <= len(display_name) <= 64):
+            await interaction.followup.send("Display name must be between 2 and 64 characters.")
+            return
+
+        if not (10 <= len(text) <= 8192):
+            await interaction.followup.send("Personality prompt must be between 10 and 8192 characters.")
+            return
+
+        clean_name = name.lower().replace(" ", "_")
+
+        if interaction.guild.id not in custom_personalities:
+            custom_personalities[interaction.guild.id] = {}
+
+        if clean_name in custom_personalities[interaction.guild.id]:
+            await interaction.followup.send(f"Personality '{clean_name}' already exists! Use `/personality_edit` to modify it.")
+            return
+
+        custom_personalities[interaction.guild.id][clean_name] = {
+            "name": display_name,
+            "prompt": text
+        }
+
+        save_personalities()
+
+        prompt_preview = text[:100] + ('...' if len(text) > 100 else '')
+        await interaction.followup.send(
+            f"✅ Imported personality **{display_name}** (`{clean_name}`) from `{file.filename}`!\n"
+            f"Use `/personality_set {clean_name}` to activate it.\n\n"
+            f"**Prompt preview:** {prompt_preview}"
+        )
+
+    @app_commands.command(name="personality_lore_set", description="Set character lore for a personality (Admin only)")
+    async def personality_lore_set(self, interaction: discord.Interaction, personality_name: str, lore_text: str = None, lore_file: discord.Attachment = None):
+        """Set character lore for a personality"""
+        await interaction.response.defer(ephemeral=True)
+
+        if not interaction.guild:
+            await interaction.followup.send("Character lore can only be set in servers, not DMs.")
+            return
+
+        if not check_admin_permissions(interaction):
+            await interaction.followup.send("❌ Only administrators can set character lore!")
+            return
+
+        clean_name = personality_name.lower().replace(" ", "_")
+        if interaction.guild.id not in custom_personalities or clean_name not in custom_personalities[interaction.guild.id]:
+            await interaction.followup.send(f"Personality '{clean_name}' not found! Use `/personality_list` to see available personalities.")
+            return
+
+        lore = ""
+        if lore_file is not None:
+            if not lore_file.filename.lower().endswith(".txt"):
+                await interaction.followup.send("❌ Please upload a valid .txt file for lore.")
+                return
+            try:
+                raw_bytes = await lore_file.read()
+                lore = raw_bytes.decode("utf-8", errors="ignore").strip()
+            except Exception as e:
+                await interaction.followup.send(f"❌ Failed to read file: {str(e)}")
+                return
+        elif lore_text is not None:
+            lore = lore_text.strip()
+
+        if not lore:
+            await interaction.followup.send("❌ Provide lore text or a .txt file.")
+            return
+
+        if not (10 <= len(lore) <= 8192):
+            await interaction.followup.send("Character lore must be between 10 and 8192 characters.")
+            return
+
+        custom_personalities[interaction.guild.id][clean_name]["lore"] = lore
+        save_personalities()
+
+        lore_preview = lore[:120] + ('...' if len(lore) > 120 else '')
+        await interaction.followup.send(
+            f"✅ Character lore set for **{custom_personalities[interaction.guild.id][clean_name]['name']}** (`{clean_name}`)!\n"
+            f"**Lore preview:** {lore_preview}"
+        )
 
     @app_commands.command(name="personality_set", description="Set the active personality for this server (Admin only)")
     async def set_personality(self, interaction: discord.Interaction, personality_name: str = None):

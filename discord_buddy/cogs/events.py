@@ -74,6 +74,7 @@ class EventsCog(commands.Cog):
             return
     
         is_dm = isinstance(message.channel, discord.DMChannel)
+        mentions_bot = client and client.user in message.mentions
 
         # Check if DMs are allowed for this user
         if is_dm and not message.author.bot:
@@ -174,20 +175,31 @@ class EventsCog(commands.Cog):
 
         # Determine if bot should respond
         should_respond = False
+        autonomous_trigger = False
+        direct_trigger = False
+        is_reply_to_bot = False
+        if message.reference and message.reference.resolved:
+            try:
+                is_reply_to_bot = message.reference.resolved.author == client.user
+            except Exception:
+                is_reply_to_bot = False
     
         # EXPLICIT CHECK: Never respond to our own messages (double protection)
         if message.author == client.user:
             should_respond = False
         # Respond to mentions, DMs, voice messages (but NOT @here or @everyone)
-        elif (client.user.mentioned_in(message) and not message.mention_everyone) or is_dm or voice_text:
+        elif (client.user.mentioned_in(message) and not message.mention_everyone) or is_dm or voice_text or is_reply_to_bot:
             should_respond = True
+            direct_trigger = True
         # Autonomous responses (with explicit protection against own messages)
         elif (guild_id and 
               message.author != client.user and  # EXPLICIT PROTECTION
               autonomous_manager.should_respond_autonomously(guild_id, message.channel.id)):
             should_respond = True
+            autonomous_trigger = True
 
         if should_respond:
+            meta_tags = build_message_meta_tags(message)
             # Handle voice messages privately (only for real users)
             if voice_text and not is_other_bot:
                 content = f"{user_name} sent you a voice message, transcript: {voice_text}"
@@ -210,6 +222,22 @@ class EventsCog(commands.Cog):
                         content = sticker_info
 
             # Add to request queue instead of processing immediately
+            special_instruction = None
+            if autonomous_trigger and not direct_trigger:
+                special_instruction = (
+                    "You are joining an ongoing group discussion via random chance. "
+                    "The latest message may not be addressed to you. "
+                    "Respond as a participant without assuming it is a direct request. "
+                    "If it seems directed to someone else, make a brief neutral interjection "
+                    "or ask a short clarifying question."
+                )
+            elif direct_trigger:
+                if re.search(r"\breact\b|\breaction\b|\bemoji\b", content.lower()):
+                    special_instruction = (
+                        "The user explicitly asked for a reaction. "
+                        "Include a [REACT: emoji] tag with an appropriate emoji."
+                    )
+
             added = await request_queue.add_request(
                 message.channel.id,
                 message,
@@ -219,7 +247,10 @@ class EventsCog(commands.Cog):
                 user_name,
                 is_dm,
                 message.author.id,
-                reply_to_name  # Pass the reply information
+                reply_to_name,  # Pass the reply information
+                special_instruction,
+                autonomous_trigger,
+                meta_tags
             )
         
             if not added:
