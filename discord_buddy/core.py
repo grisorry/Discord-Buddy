@@ -2609,6 +2609,15 @@ def record_response_failure() -> None:
         print(f"🚨 Too many consecutive failures ({consecutive_response_failures}). Exiting (Ctrl+C).")
         raise KeyboardInterrupt
 
+def coerce_int(value: Any) -> Optional[int]:
+    """Best-effort int conversion for token usage fields."""
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
 async def fetch_openrouter_generation_usage(generation_id: str, retries: int = 3, delay_s: float = 0.5) -> None:
     """Fetch OpenRouter generation stats for accurate token usage."""
     if not generation_id or not CUSTOM_API_KEY:
