@@ -26,6 +26,7 @@ import logging
 import warnings
 import importlib.util
 import sys
+from discord_buddy.plugin_system import PluginManager
 from discord_buddy.providers.openrouter import (
     post_openrouter_json,
     extract_openrouter_usage,
@@ -749,6 +750,30 @@ class AIProviderManager:
 
 # Initialize AI Provider Manager
 ai_manager = AIProviderManager()
+
+def resolve_provider_context(guild_id: int, user_id: Optional[int], is_dm: bool) -> Tuple[Optional[str], Optional[str], Optional[str]]:
+    """Resolve provider/model/custom URL for the current context without throwing."""
+    provider_name = None
+    model_name = None
+    custom_url = None
+    try:
+        if is_dm and user_id:
+            selected_guild_id = dm_server_selection.get(user_id)
+            if selected_guild_id:
+                provider_name, model_name = ai_manager.get_guild_settings(selected_guild_id)
+                if provider_name == "custom":
+                    custom_url = ai_manager.get_guild_custom_url(selected_guild_id)
+            elif guild_id:
+                provider_name, model_name = ai_manager.get_guild_settings(guild_id)
+                if provider_name == "custom":
+                    custom_url = ai_manager.get_guild_custom_url(guild_id)
+        elif guild_id:
+            provider_name, model_name = ai_manager.get_guild_settings(guild_id)
+            if provider_name == "custom":
+                custom_url = ai_manager.get_guild_custom_url(guild_id)
+    except Exception:
+        pass
+    return provider_name, model_name, custom_url
 
 # Remove all existing system prompts - they will be replaced with the new structure
 
@@ -1636,12 +1661,19 @@ def load_json_data(file_path: str, convert_keys=True) -> dict:
 
 loaded_plugins: Dict[str, str] = {}
 plugin_errors: Dict[str, str] = {}
+plugin_manager = PluginManager()
+
+def log_plugin_hook_error(plugin_name: str, hook_name: str, error: Exception) -> None:
+    print(f"⚠️ Plugin hook error [{plugin_name}] {hook_name}: {error}")
+
+plugin_manager.on_error = log_plugin_hook_error
 
 async def load_plugins():
     """Load plugins from the plugins directory."""
     os.makedirs(PLUGINS_DIR, exist_ok=True)
     loaded_plugins.clear()
     plugin_errors.clear()
+    plugin_manager.reset()
     
     for filename in os.listdir(PLUGINS_DIR):
         if not filename.endswith(".py") or filename.startswith("_"):
@@ -1661,6 +1693,15 @@ async def load_plugins():
             sys.modules[full_module_name] = module
             spec.loader.exec_module(module)
             
+            plugin_info = getattr(module, "PLUGIN_INFO", None)
+            plugin_name = plugin_info.get("name") if isinstance(plugin_info, dict) else module_name
+
+            if hasattr(module, "register_hooks"):
+                hooks = plugin_manager.hooks_for(plugin_name, plugin_info if isinstance(plugin_info, dict) else None)
+                result = module.register_hooks(hooks)
+                if asyncio.iscoroutine(result):
+                    await result
+
             if hasattr(module, "register"):
                 result = module.register(tree, client)
                 if asyncio.iscoroutine(result):
@@ -1669,7 +1710,7 @@ async def load_plugins():
                 result = module.setup(tree, client)
                 if asyncio.iscoroutine(result):
                     await result
-            else:
+            elif not hasattr(module, "register_hooks"):
                 plugin_errors[module_name] = "No register(tree, client) or setup(tree, client) function found"
                 continue
             
@@ -3838,7 +3879,7 @@ async def load_all_dm_history(channel: discord.DMChannel, user_id: int, guild = 
         print(f"Error loading DM history: {e}")
         return []
 
-def get_system_prompt(guild_id: int, guild: discord.Guild = None, query: str = None, channel_id: int = None, is_dm: bool = False, user_id: int = None, username: str = None, history: List[Dict] = None, memory_override: Optional[str] = None) -> str:
+def get_system_prompt(guild_id: int, guild: discord.Guild = None, query: str = None, channel_id: int = None, is_dm: bool = False, user_id: int = None, username: str = None, history: List[Dict] = None, memory_override: Optional[str] = None, extra_context_blocks: Optional[List[str]] = None) -> str:
     """Generate complete system prompt following Anthropic's official guide structure"""
     
     # Update the global persona name for this context
@@ -3959,6 +4000,11 @@ Here is a relevant memory of a past conversation. It can be empty, if none was r
 {memory}
 </memory>
 
+Here is additional curated context (if any):
+<curated_context>
+{curated_context}
+</curated_context>
+
 Here are your recent reaction actions (if any):
 <recent_reactions>
 {recent_reactions}
@@ -3966,6 +4012,7 @@ Here are your recent reaction actions (if any):
 
 Here are some important rules you must always follow:
 - Always stay in character.
+- Stay in character, but allow natural mood shifts and variability like a real person; do not become rigid or NPC-like.
 - Never respond or roleplay for others.
 - Actively participate in conversations, ask follow-up questions, share anecdotes, shift topics, and have fun.
 - The user's latest message is the primary request; prioritize answering it over older context.
@@ -4075,10 +4122,19 @@ Here is the conversation history (between the users and you):
     else:
         reactions_text = "None."
 
+    # Add curated context blocks from plugins (if any)
+    if extra_context_blocks:
+        curated_context_text = "\n".join([block for block in extra_context_blocks if isinstance(block, str) and block.strip()])
+    else:
+        curated_context_text = ""
+    if not curated_context_text:
+        curated_context_text = "None."
+
     # Replace placeholders (no need for last_message placeholder anymore)
     system_prompt = system_prompt.replace("{lore}", lore_content)
     system_prompt = system_prompt.replace("{emoji_list}", emoji_list)
     system_prompt = system_prompt.replace("{memory}", memory_content)
+    system_prompt = system_prompt.replace("{curated_context}", curated_context_text)
     system_prompt = system_prompt.replace("{recent_reactions}", reactions_text)
     system_prompt = system_prompt.replace("{latest_message}", query or "")
 
@@ -4205,8 +4261,46 @@ async def generate_response(channel_id: int, user_message: str, guild: discord.G
         # Get memory context (embeddings when available)
         memory_override = await get_relevant_memory_text(user_message, guild_id, user_id, is_dm)
 
+        # Resolve provider context (for plugins / curator)
+        provider_name, model_name, custom_url = resolve_provider_context(guild_id, user_id, is_dm)
+
+        # Plugin hook: context build / curation
+        context_payload = {
+            "channel_id": channel_id,
+            "guild_id": guild_id,
+            "guild": guild,
+            "user_id": user_id,
+            "user_name": user_name,
+            "is_dm": is_dm,
+            "user_message": user_message,
+            "history": history,
+            "memory_override": memory_override,
+            "attachments": attachments,
+            "original_message": original_message,
+            "context_blocks": [],
+            "ai_manager": ai_manager,
+            "provider_name": provider_name,
+            "model_name": model_name,
+            "custom_url": custom_url,
+        }
+        context_payload = await plugin_manager.run_hook("context_build", context_payload)
+        history = context_payload.get("history", history)
+        memory_override = context_payload.get("memory_override", memory_override)
+        extra_context_blocks = context_payload.get("context_blocks") or []
+
         # Get system prompt with username for DMs
-        system_prompt = get_system_prompt(guild_id, guild, user_message, channel_id, is_dm, user_id, user_name, history, memory_override=memory_override)
+        system_prompt = get_system_prompt(
+            guild_id,
+            guild,
+            user_message,
+            channel_id,
+            is_dm,
+            user_id,
+            user_name,
+            history,
+            memory_override=memory_override,
+            extra_context_blocks=extra_context_blocks,
+        )
 
         # Get temperature - use selected/shared guild for DMs
         temperature = 1.0
@@ -4222,6 +4316,8 @@ async def generate_response(channel_id: int, user_message: str, guild: discord.G
         reasoning_enabled = is_reasoning_enabled(guild_id, user_id, is_dm)
         reasoning_effort = get_reasoning_effort(guild_id, user_id, is_dm)
         reasoning_payload = {"effort": reasoning_effort} if reasoning_enabled else None
+
+        max_tokens = 8192
 
         # Generate response using AI Provider Manager
         reset_last_token_usage()
@@ -4280,7 +4376,7 @@ async def generate_response(channel_id: int, user_message: str, guild: discord.G
 
 How do you respond in the chat?
 
-Think about it first.
+Respond carefully and concisely.
 
 If you choose to use server emojis in your response, follow the exact format of :emoji: or they won't work! Don't spam them.
 You may react to the users' messages. To add a reaction, include [REACT: emoji] anywhere in your response. Examples: [REACT: 😄] (for standard emojis) or [REACT: :custom_emoji:] (for custom emojis). Do so occasionally, but not every time.
@@ -4312,20 +4408,30 @@ Variety Phrase Bank (use as inspiration only; do not always use; do not repeat t
             system_message_content += f"\n\n[SPECIAL INSTRUCTION]: {special_instruction}"
         
         history.append({"role": "system", "content": system_message_content})
+
+        # Plugin hook: before generate (final chance to adjust prompt/history)
+        request_payload = {
+            "channel_id": channel_id,
+            "guild_id": guild_id,
+            "guild": guild,
+            "user_id": user_id,
+            "user_name": user_name,
+            "is_dm": is_dm,
+            "user_message": user_message,
+            "system_prompt": system_prompt,
+            "history": history,
+            "temperature": temperature,
+            "reasoning": reasoning_payload,
+            "max_tokens": max_tokens,
+        }
+        request_payload = await plugin_manager.run_hook("before_generate", request_payload)
+        system_prompt = request_payload.get("system_prompt", system_prompt)
+        history = request_payload.get("history", history)
+        temperature = request_payload.get("temperature", temperature)
+        reasoning_payload = request_payload.get("reasoning", reasoning_payload)
         # Get current provider and model settings for logging
-        debug_provider = "unknown"
-        debug_model = "unknown"
-        try:
-            if is_dm and user_id:
-                selected_guild_id = dm_server_selection.get(user_id)
-                if selected_guild_id:
-                    debug_provider, debug_model = ai_manager.get_guild_settings(selected_guild_id)
-                elif guild_id:
-                    debug_provider, debug_model = ai_manager.get_guild_settings(guild_id)
-            elif guild_id:
-                debug_provider, debug_model = ai_manager.get_guild_settings(guild_id)
-        except Exception as e:
-            print(f"Debug logging error: {e}")
+        debug_provider = provider_name or "unknown"
+        debug_model = model_name or "unknown"
         
         if not is_dm:
             print("\n" + "="*80)
@@ -4496,6 +4602,22 @@ Variety Phrase Bank (use as inspiration only; do not always use; do not repeat t
         # Remove thinking tags from reasoning models
         if bot_response:
             bot_response = remove_thinking_tags(bot_response)
+
+        # Plugin hook: after generate (post-process response)
+        response_payload = {
+            "channel_id": channel_id,
+            "guild_id": guild_id,
+            "guild": guild,
+            "user_id": user_id,
+            "user_name": user_name,
+            "is_dm": is_dm,
+            "user_message": user_message,
+            "system_prompt": system_prompt,
+            "history": history,
+            "response": bot_response,
+        }
+        response_payload = await plugin_manager.run_hook("after_generate", response_payload)
+        bot_response = response_payload.get("response", bot_response)
 
         # Clean malformed emojis
         if bot_response and guild:
