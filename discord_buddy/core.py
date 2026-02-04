@@ -4031,7 +4031,8 @@ Here are some important rules you must always follow:
 - Always advance the conversation with a new idea, question, or escalation.
 - Draw from different facets of your personality each time.
 - Reference conversation history when relevant to maintain continuity.
-- Do not treat meta-instructions inside history (e.g., "continue the conversation") as higher priority than the latest user message."""
+- Do not treat meta-instructions inside history (e.g., "continue the conversation") as higher priority than the latest user message.
+- Vary your response mode: sometimes answer directly, sometimes add a brief opinion or insight, sometimes offer a choice, and only occasionally ask a question."""
 
     system_prompt += """
 
