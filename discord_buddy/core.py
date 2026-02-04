@@ -1436,7 +1436,8 @@ class RequestQueue:
                     user_name=user_name,
                     is_dm=is_dm,
                     user_id=user_id,
-                    original_message=message
+                    original_message=message,
+                    autonomous_join=autonomous_join
                 )
 
                 if bot_response is None:
@@ -4164,7 +4165,7 @@ def split_message_by_newlines(message: str) -> List[str]:
         return []
     return [part.strip() for part in message.split('\n') if part.strip()]
 
-async def generate_response(channel_id: int, user_message: str, guild: discord.Guild = None, attachments: List[discord.Attachment] = None, user_name: str = None, is_dm: bool = False, user_id: int = None, original_message: discord.Message = None) -> str:
+async def generate_response(channel_id: int, user_message: str, guild: discord.Guild = None, attachments: List[discord.Attachment] = None, user_name: str = None, is_dm: bool = False, user_id: int = None, original_message: discord.Message = None, autonomous_join: bool = False) -> str:
     """Generate response using the AI Provider Manager"""
     # print(f"DEBUG: generate_response called with user_message: {repr(user_message)}")
     try:
@@ -4279,6 +4280,7 @@ async def generate_response(channel_id: int, user_message: str, guild: discord.G
             "attachments": attachments,
             "original_message": original_message,
             "context_blocks": [],
+            "autonomous_join": autonomous_join,
             "ai_manager": ai_manager,
             "provider_name": provider_name,
             "model_name": model_name,
@@ -4288,6 +4290,11 @@ async def generate_response(channel_id: int, user_message: str, guild: discord.G
         history = context_payload.get("history", history)
         memory_override = context_payload.get("memory_override", memory_override)
         extra_context_blocks = context_payload.get("context_blocks") or []
+        if context_payload.get("skip_response"):
+            skip_reason = context_payload.get("skip_reason", "context_decision_hold")
+            if not is_dm:
+                print(f"Context decision skipped response: {skip_reason}")
+            return None
 
         # Get system prompt with username for DMs
         system_prompt = get_system_prompt(
