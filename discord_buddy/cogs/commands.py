@@ -1,4 +1,6 @@
 import os
+import re
+from typing import Optional
 import discord
 from discord import app_commands
 from discord.ext import commands
@@ -13,7 +15,21 @@ class CommandsCog(commands.Cog):
     # SLASH COMMANDS - AI PROVIDER MANAGEMENT
 
     @app_commands.command(name="model_set", description="Set AI provider and model for this server (Admin only)")
-    async def set_model(self, interaction: discord.Interaction, provider: str, model: str = None, custom_url: str = None):
+    @app_commands.describe(
+        supports_reasoning="Override reasoning capability for this model",
+        supports_vision="Override vision capability for this model",
+        probe_capabilities="Run capability probes when unknown (explicit)"
+    )
+    async def set_model(
+        self,
+        interaction: discord.Interaction,
+        provider: str,
+        model: str = None,
+        custom_url: str = None,
+        supports_reasoning: Optional[bool] = None,
+        supports_vision: Optional[bool] = None,
+        probe_capabilities: Optional[bool] = None
+    ):
         """Set AI provider and model for the server"""
         await interaction.response.defer(ephemeral=True)
     
@@ -80,18 +96,63 @@ class CommandsCog(commands.Cog):
         # Set for guild
         success = ai_manager.set_guild_provider(interaction.guild.id, provider, model, custom_url)
         if success:
-            response_text = f"✅ **Server AI Model Set!**\n" \
-                           f"**Provider:** {provider.title()}\n" \
-                           f"**Model:** {model}\n"
-        
+            # Update or probe model capabilities (optional)
+            if supports_reasoning is not None or supports_vision is not None or probe_capabilities is not None:
+                update_model_capabilities(
+                    provider,
+                    model,
+                    custom_url=custom_url,
+                    supports_reasoning=supports_reasoning,
+                    supports_vision=supports_vision,
+                    probe_allowed=probe_capabilities,
+                    source="manual"
+                )
+
+            probe_notes = []
+            if probe_capabilities:
+                probe_results = await probe_model_capabilities(provider, model, custom_url)
+                probed_reasoning = probe_results.get("supports_reasoning")
+                probed_vision = probe_results.get("supports_vision")
+
+                if probed_reasoning is not None and supports_reasoning is None:
+                    update_model_capabilities(
+                        provider,
+                        model,
+                        custom_url=custom_url,
+                        supports_reasoning=probed_reasoning,
+                        source="probe"
+                    )
+                if probed_vision is not None and supports_vision is None:
+                    update_model_capabilities(
+                        provider,
+                        model,
+                        custom_url=custom_url,
+                        supports_vision=probed_vision,
+                        source="probe"
+                    )
+
+                if probed_reasoning is not None:
+                    probe_notes.append(f"Reasoning support: {probed_reasoning}")
+                if probed_vision is not None:
+                    probe_notes.append(f"Vision support: {probed_vision}")
+
+            response_text = (
+                f"**Server AI Model Set!**\n"
+                f"**Provider:** {provider.title()}\n"
+                f"**Model:** {model}\n"
+            )
+
             if provider == "custom" and custom_url:
                 response_text += f"**Custom URL:** `{custom_url}`\n"
-        
-            response_text += f"\n💡 This affects all conversations in this server, including DMs with server members."
-        
+
+            if probe_notes:
+                response_text += "**Capability Probe:** " + ", ".join(probe_notes) + "\n"
+
+            response_text += "\nThis affects all conversations in this server, including DMs with server members."
+
             await interaction.followup.send(response_text)
         else:
-            await interaction.followup.send("❌ Failed to set provider.")
+            await interaction.followup.send("Failed to set provider.")
 
     @app_commands.command(name="dm_server_select", description="Choose which server's settings to use for your DMs")
     async def dm_server_select(self, interaction: discord.Interaction, server_name: str = None):
@@ -547,6 +608,132 @@ class CommandsCog(commands.Cog):
         except Exception as e:
             await interaction.followup.send(f"❌ Sync failed: {e}")
 
+    # PLUGIN MANAGEMENT COMMANDS
+
+    @app_commands.command(name="plugin_list", description="List loaded plugins and errors (Admin only in servers)")
+    async def plugin_list(self, interaction: discord.Interaction):
+        """List loaded plugins and any load errors."""
+        await interaction.response.defer(ephemeral=True)
+
+        if not interaction.guild or not check_admin_permissions(interaction):
+            await interaction.followup.send("❌ Only administrators can use this command in servers.")
+            return
+
+        embed = discord.Embed(
+            title="🧩 Plugins",
+            color=0x00ccff
+        )
+
+        if loaded_plugins:
+            lines = []
+            for module_name in sorted(loaded_plugins.keys()):
+                plugin_name = loaded_plugin_names.get(module_name, module_name)
+                info = loaded_plugin_info.get(module_name, {})
+                version = info.get("version", "unknown") if isinstance(info, dict) else "unknown"
+                lines.append(f"• {module_name} (name={plugin_name}, v{version})")
+            embed.add_field(name="Loaded", value="\n".join(lines), inline=False)
+        else:
+            embed.add_field(name="Loaded", value="None", inline=False)
+
+        if plugin_errors:
+            error_lines = [f"• {name}: {error}" for name, error in plugin_errors.items()]
+            embed.add_field(name="Errors", value="\n".join(error_lines), inline=False)
+        else:
+            embed.add_field(name="Errors", value="None", inline=False)
+
+        await interaction.followup.send(embed=embed)
+
+    @app_commands.command(name="plugin_status", description="Show plugin status and settings (Admin only in servers)")
+    async def plugin_status(self, interaction: discord.Interaction, name: str):
+        """Show plugin metadata and effective enablement."""
+        await interaction.response.defer(ephemeral=True)
+
+        if not interaction.guild or not check_admin_permissions(interaction):
+            await interaction.followup.send("❌ Only administrators can use this command in servers.")
+            return
+
+        module_name = resolve_plugin_module_name(name) or name
+        plugin_name = loaded_plugin_names.get(module_name, module_name)
+        info = loaded_plugin_info.get(module_name, {})
+        settings = get_plugin_settings(plugin_name)
+        defaults = settings.get("default", {}) if isinstance(settings, dict) else {}
+        guild_settings = settings.get("guilds", {}).get(str(interaction.guild.id), {}) if isinstance(settings, dict) else {}
+
+        default_enabled = defaults.get("enabled", True)
+        guild_enabled = guild_settings.get("enabled", None)
+        effective_enabled = guild_enabled if guild_enabled is not None else default_enabled
+
+        embed = discord.Embed(
+            title=f"🧩 Plugin Status: {module_name}",
+            color=0x00ccff
+        )
+
+        if isinstance(info, dict) and info:
+            embed.add_field(name="Info", value=f"Name: {plugin_name}\nVersion: {info.get('version', 'unknown')}\nPriority: {info.get('priority', 'n/a')}", inline=False)
+            if info.get("description"):
+                embed.add_field(name="Description", value=str(info.get("description")), inline=False)
+        else:
+            embed.add_field(name="Info", value=f"Name: {plugin_name}\nVersion: unknown", inline=False)
+
+        embed.add_field(
+            name="Enabled",
+            value=f"Default: {default_enabled}\nServer override: {guild_enabled if guild_enabled is not None else 'None'}\nEffective: {effective_enabled}",
+            inline=False
+        )
+
+        if module_name in plugin_errors:
+            embed.add_field(name="Load Error", value=plugin_errors.get(module_name), inline=False)
+
+        await interaction.followup.send(embed=embed)
+
+    @app_commands.command(name="plugin_enable", description="Enable a plugin for this server (Admin only)")
+    async def plugin_enable(self, interaction: discord.Interaction, name: str):
+        """Enable a plugin for the current server."""
+        await interaction.response.defer(ephemeral=True)
+
+        if not interaction.guild or not check_admin_permissions(interaction):
+            await interaction.followup.send("❌ Only administrators can use this command in servers.")
+            return
+
+        module_name = resolve_plugin_module_name(name) or name
+        plugin_name = loaded_plugin_names.get(module_name, module_name)
+        update_plugin_guild_settings(plugin_name, interaction.guild.id, {"enabled": True})
+        await interaction.followup.send(f"✅ Plugin **{plugin_name}** enabled for this server.")
+
+    @app_commands.command(name="plugin_disable", description="Disable a plugin for this server (Admin only)")
+    async def plugin_disable(self, interaction: discord.Interaction, name: str):
+        """Disable a plugin for the current server."""
+        await interaction.response.defer(ephemeral=True)
+
+        if not interaction.guild or not check_admin_permissions(interaction):
+            await interaction.followup.send("❌ Only administrators can use this command in servers.")
+            return
+
+        module_name = resolve_plugin_module_name(name) or name
+        plugin_name = loaded_plugin_names.get(module_name, module_name)
+        update_plugin_guild_settings(plugin_name, interaction.guild.id, {"enabled": False})
+        await interaction.followup.send(f"✅ Plugin **{plugin_name}** disabled for this server.")
+
+    @app_commands.command(name="plugin_reload", description="Reload a plugin (Admin only in servers)")
+    async def plugin_reload(self, interaction: discord.Interaction, name: str = "all"):
+        """Reload one plugin or all plugins."""
+        await interaction.response.defer(ephemeral=True)
+
+        if not interaction.guild or not check_admin_permissions(interaction):
+            await interaction.followup.send("❌ Only administrators can use this command in servers.")
+            return
+
+        if not name or name.lower() == "all":
+            await load_plugins()
+            await interaction.followup.send("✅ Reloaded all plugins.")
+            return
+
+        success, message = await reload_plugin(name)
+        if success:
+            await interaction.followup.send(f"✅ {message}")
+        else:
+            await interaction.followup.send(f"❌ {message}")
+
     # HELP COMMANDS
 
     @app_commands.command(name="health", description="Show bot health diagnostics")
@@ -647,9 +834,14 @@ class CommandsCog(commands.Cog):
     
 
         embed.add_field(
-            name="???? Plugin Commands",
-            value="`/context_plugin_info` - Show Context Awareness plugin settings (Admin only)\n"
-                "`/context_plugin_set [enabled] [max_history] [max_words] [history_mode]` - Configure Context Awareness plugin (Admin only)",
+            name="Plugin Commands",
+            value="`/plugin_list` - List loaded plugins (Admin only)\n"
+                "`/plugin_status <name>` - Show plugin status (Admin only)\n"
+                "`/plugin_enable <name>` - Enable plugin for this server (Admin only)\n"
+                "`/plugin_disable <name>` - Disable plugin for this server (Admin only)\n"
+                "`/plugin_reload [name|all]` - Reload plugins (Admin only)\n"
+                "`/curated_context_info` - Show Curated Context settings (Admin only)\n"
+                "`/curated_context_set [enabled] [max_history] [max_words] [history_mode]` - Configure Curated Context (Admin only)",
             inline=False
         )
 
@@ -698,7 +890,7 @@ class CommandsCog(commands.Cog):
         embed.add_field(
             name="🧠 Memory Commands (Context-Aware)",
             value="**Memories of conversations, works in both servers and DMs with separate storages!**\n"
-                "`/memory_generate <num_messages>` - Generate memory summary\n"
+                "`/memory_generate <num_messages> [channel]` - Generate memory summary\n"
                 "`/memory_save <summary>` - Save a memory manually\n"
                 "`/memory_list` - View all saved memories\n"
                 "`/memory_view <number>` - View specific memory\n"
@@ -2302,7 +2494,8 @@ class CommandsCog(commands.Cog):
     # MEMORY COMMANDS
 
     @app_commands.command(name="memory_generate", description="Generate a memory summary from recent messages (context-aware)")
-    async def generate_memory(self, interaction: discord.Interaction, num_messages: int):
+    @app_commands.describe(channel="Channel name or ID (defaults to current channel)")
+    async def generate_memory(self, interaction: discord.Interaction, num_messages: int, channel: str = None):
         """Generate and save memory summary from recent conversation"""
         await interaction.response.defer(ephemeral=True)
     
@@ -2311,10 +2504,57 @@ class CommandsCog(commands.Cog):
             return
     
         is_dm = isinstance(interaction.channel, discord.DMChannel)
+
+        if is_dm and channel:
+            await interaction.followup.send("Channel selection isn't available in DMs.")
+            return
+
+        target_channel = interaction.channel
+        if channel and interaction.guild:
+            channel_str = channel.strip()
+            channel_id = None
+            match = re.search(r"\d{5,}", channel_str)
+            if match:
+                try:
+                    channel_id = int(match.group(0))
+                except ValueError:
+                    channel_id = None
+
+            if channel_id:
+                target_channel = interaction.guild.get_channel(channel_id)
+            else:
+                name_lookup = channel_str.lstrip("#").lower()
+                matches = [c for c in interaction.guild.text_channels if c.name.lower() == name_lookup]
+                if not matches:
+                    matches = [c for c in interaction.guild.text_channels if name_lookup in c.name.lower()]
+                if len(matches) == 1:
+                    target_channel = matches[0]
+                elif len(matches) > 1:
+                    suggestions = ", ".join(f"#{c.name}" for c in matches[:5])
+                    await interaction.followup.send(
+                        f"❌ Multiple channels match '{channel_str}'. Be more specific. Examples: {suggestions}"
+                    )
+                    return
+                else:
+                    await interaction.followup.send(f"❌ Channel not found: {channel_str}")
+                    return
+
+        if not target_channel:
+            await interaction.followup.send("❌ Channel not found.")
+            return
     
         try:
             # Check if there's conversation history first
-            history = get_conversation_history(interaction.channel.id)
+            history = get_conversation_history(target_channel.id)
+            if not history and not is_dm and interaction.guild:
+                await load_channel_history_from_discord(
+                    target_channel,
+                    interaction.guild,
+                    target_channel.id,
+                    exclude_message_id=None,
+                    trigger_user_id=interaction.user.id
+                )
+                history = get_conversation_history(target_channel.id)
             if not history:
                 await interaction.followup.send("❌ **No conversation history found!**\n"
                                                "Start a conversation with the bot first, then try generating a memory.")
@@ -2328,7 +2568,7 @@ class CommandsCog(commands.Cog):
                 if is_dm:
                     user_name = interaction.user.display_name if hasattr(interaction.user, 'display_name') else interaction.user.name
                     memory_summary = await generate_memory_summary(
-                        interaction.channel.id, 
+                        target_channel.id,
                         num_messages, 
                         guild=None, 
                         user_id=interaction.user.id,
@@ -2337,11 +2577,11 @@ class CommandsCog(commands.Cog):
                     context = "DM conversation"
                 else:
                     memory_summary = await generate_memory_summary(
-                        interaction.channel.id, 
+                        target_channel.id,
                         num_messages, 
                         interaction.guild
                     )
-                    context = "server conversation"
+                    context = f"server conversation in #{target_channel.name}"
         
             # Check if memory generation failed
             if not memory_summary:

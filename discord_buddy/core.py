@@ -165,6 +165,7 @@ DM_REASONING_EFFORT_FILE = os.path.join(DATA_DIR, "dm_reasoning_effort.json")
 EMBEDDINGS_SETTINGS_FILE = os.path.join(DATA_DIR, "embeddings_settings.json")
 DM_EMBEDDINGS_SETTINGS_FILE = os.path.join(DATA_DIR, "dm_embeddings_settings.json")
 CLI_REASONING_STREAM_FILE = os.path.join(DATA_DIR, "cli_reasoning_stream.json")
+MODEL_CAPABILITIES_FILE = os.path.join(DATA_DIR, "model_capabilities.json")
 
 # Files for old prompt system - TO BE REMOVED
 CUSTOM_PROMPTS_FILE = os.path.join(DATA_DIR, "custom_prompts.json")
@@ -371,9 +372,22 @@ class CustomProvider(AIProvider):
                 elif isinstance(content, str) and content.strip():
                     formatted_messages.append({"role": role, "content": content})
             
-            # If we have images, test vision support only once
+            # If we have images, check vision support (probe only if explicitly allowed)
             if has_images:
-                supports_vision = await self.supports_vision_dynamic(model)
+                supports_vision = True
+                cap_entry = get_model_capabilities("custom", model, self.base_url)
+                if "supports_vision" in cap_entry:
+                    supports_vision = bool(cap_entry.get("supports_vision"))
+                elif is_probe_allowed("custom", model, self.base_url):
+                    supports_vision = await self.supports_vision_dynamic(model)
+                    update_model_capabilities(
+                        "custom",
+                        model,
+                        custom_url=self.base_url,
+                        supports_vision=supports_vision,
+                        source="probe"
+                    )
+
                 if not supports_vision:
                     # Convert images to text descriptions
                     for message in formatted_messages:
@@ -1753,7 +1767,14 @@ def load_json_data(file_path: str, convert_keys=True) -> dict:
         pass
     return {}
 
+def load_json_data_raw(file_path: str) -> dict:
+    """Load JSON data without converting dict keys."""
+    return load_json_data(file_path, convert_keys=False)
+
 loaded_plugins: Dict[str, str] = {}
+loaded_plugin_names: Dict[str, str] = {}
+loaded_plugin_info: Dict[str, Dict[str, Any]] = {}
+loaded_plugin_modules: Dict[str, Any] = {}
 plugin_errors: Dict[str, str] = {}
 plugin_manager = PluginManager()
 
@@ -1762,10 +1783,200 @@ def log_plugin_hook_error(plugin_name: str, hook_name: str, error: Exception) ->
 
 plugin_manager.on_error = log_plugin_hook_error
 
+def resolve_plugin_module_name(identifier: str) -> Optional[str]:
+    if not identifier:
+        return None
+    if identifier in loaded_plugins:
+        return identifier
+    for module_name, plugin_name in loaded_plugin_names.items():
+        if plugin_name == identifier:
+            return module_name
+    return None
+
+async def _load_plugin_module(module_name: str, module_path: str) -> bool:
+    full_module_name = f"plugins.{module_name}"
+    try:
+        spec = importlib.util.spec_from_file_location(full_module_name, module_path)
+        if spec is None or spec.loader is None:
+            plugin_errors[module_name] = "Failed to load module spec"
+            return False
+
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[full_module_name] = module
+        spec.loader.exec_module(module)
+
+        plugin_info = getattr(module, "PLUGIN_INFO", None)
+        plugin_name = plugin_info.get("name") if isinstance(plugin_info, dict) else module_name
+
+        if hasattr(module, "register_hooks"):
+            hooks = plugin_manager.hooks_for(plugin_name, plugin_info if isinstance(plugin_info, dict) else None)
+            result = module.register_hooks(hooks)
+            if asyncio.iscoroutine(result):
+                await result
+
+        if hasattr(module, "register"):
+            result = module.register(tree, client)
+            if asyncio.iscoroutine(result):
+                await result
+        elif hasattr(module, "setup"):
+            result = module.setup(tree, client)
+            if asyncio.iscoroutine(result):
+                await result
+        elif not hasattr(module, "register_hooks"):
+            plugin_errors[module_name] = "No register(tree, client) or setup(tree, client) function found"
+            return False
+
+        loaded_plugins[module_name] = module_path
+        loaded_plugin_names[module_name] = plugin_name
+        loaded_plugin_modules[module_name] = module
+        if isinstance(plugin_info, dict):
+            loaded_plugin_info[module_name] = plugin_info
+        else:
+            loaded_plugin_info.pop(module_name, None)
+        plugin_errors.pop(module_name, None)
+        return True
+    except Exception as e:
+        plugin_errors[module_name] = str(e)
+        return False
+
+model_capabilities: Dict[str, Dict[str, Any]] = load_json_data_raw(MODEL_CAPABILITIES_FILE)
+
+def _capability_key(provider: str, model: str, custom_url: str = None) -> str:
+    base = f"{provider or ''}|{model or ''}"
+    if provider == "custom":
+        base = f"{base}|{custom_url or ''}"
+    return base.lower()
+
+def save_model_capabilities() -> None:
+    try:
+        os.makedirs(DATA_DIR, exist_ok=True)
+        with open(MODEL_CAPABILITIES_FILE, "w") as f:
+            json.dump(model_capabilities, f, indent=2)
+    except Exception:
+        pass
+
+def get_model_capabilities(provider: str, model: str, custom_url: str = None) -> Dict[str, Any]:
+    key = _capability_key(provider, model, custom_url)
+    entry = model_capabilities.get(key, {})
+    return entry if isinstance(entry, dict) else {}
+
+def update_model_capabilities(
+    provider: str,
+    model: str,
+    custom_url: str = None,
+    supports_reasoning: Optional[bool] = None,
+    supports_vision: Optional[bool] = None,
+    probe_allowed: Optional[bool] = None,
+    source: str = "manual",
+) -> Dict[str, Any]:
+    key = _capability_key(provider, model, custom_url)
+    entry = model_capabilities.get(key, {})
+    if not isinstance(entry, dict):
+        entry = {}
+    entry["provider"] = provider
+    entry["model"] = model
+    if provider == "custom" and custom_url:
+        entry["custom_url"] = custom_url
+    if supports_reasoning is not None:
+        entry["supports_reasoning"] = bool(supports_reasoning)
+    if supports_vision is not None:
+        entry["supports_vision"] = bool(supports_vision)
+    if probe_allowed is not None:
+        entry["probe_allowed"] = bool(probe_allowed)
+    entry["source"] = source
+    entry["updated_at"] = int(time.time())
+    model_capabilities[key] = entry
+    save_model_capabilities()
+    return entry
+
+def is_probe_allowed(provider: str, model: str, custom_url: str = None) -> bool:
+    entry = get_model_capabilities(provider, model, custom_url)
+    return bool(entry.get("probe_allowed", False))
+
+def infer_vision_support(provider: str, model: str) -> Optional[bool]:
+    if provider == "openai":
+        openai_provider = ai_manager.providers.get("openai")
+        if openai_provider and hasattr(openai_provider, "supports_vision") and model:
+            return bool(openai_provider.supports_vision(model))
+        return None
+    if provider in ("claude", "gemini"):
+        return True
+    return None
+
+async def probe_reasoning_support(provider: str, model: str, custom_url: str = None) -> Optional[bool]:
+    if provider != "custom":
+        return False
+    if not custom_url or "openrouter.ai" not in custom_url.lower():
+        return False
+    if not CUSTOM_API_KEY:
+        return None
+
+    input_messages = [
+        {
+            "type": "message",
+            "role": "user",
+            "content": [{"type": "input_text", "text": "Ping."}],
+        }
+    ]
+    payload = {
+        "model": model,
+        "input": input_messages,
+        "reasoning": {"effort": "low"},
+        "max_output_tokens": 16,
+        "temperature": 0,
+    }
+    try:
+        data, _ = await post_openrouter_json(custom_url, CUSTOM_API_KEY, "/responses", payload, timeout=30)
+    except Exception:
+        return None
+
+    if not isinstance(data, dict):
+        return None
+    error_obj = data.get("error")
+    if error_obj:
+        error_text = ""
+        if isinstance(error_obj, dict):
+            error_text = str(error_obj.get("message") or error_obj.get("error") or error_obj)
+        else:
+            error_text = str(error_obj)
+        lowered = error_text.lower()
+        if any(token in lowered for token in ["reasoning", "unsupported", "not supported", "invalid"]):
+            return False
+        return None
+
+    output_text = extract_responses_output_text(data)
+    summary_text = extract_responses_reasoning_summary(data)
+    if output_text or summary_text or data.get("output"):
+        return True
+    return None
+
+async def probe_vision_support(provider: str, model: str, custom_url: str = None) -> Optional[bool]:
+    if provider == "custom":
+        custom_provider = None
+        if custom_url:
+            custom_provider = ai_manager.get_custom_provider(custom_url)
+        else:
+            custom_provider = ai_manager.providers.get("custom")
+        if custom_provider and hasattr(custom_provider, "supports_vision_dynamic") and model:
+            if not getattr(custom_provider, "api_key", None):
+                return None
+            return await custom_provider.supports_vision_dynamic(model)
+        return None
+    return infer_vision_support(provider, model)
+
+async def probe_model_capabilities(provider: str, model: str, custom_url: str = None) -> Dict[str, Optional[bool]]:
+    results: Dict[str, Optional[bool]] = {"supports_reasoning": None, "supports_vision": None}
+    results["supports_reasoning"] = await probe_reasoning_support(provider, model, custom_url)
+    results["supports_vision"] = await probe_vision_support(provider, model, custom_url)
+    return results
+
 async def load_plugins():
     """Load plugins from the plugins directory."""
     os.makedirs(PLUGINS_DIR, exist_ok=True)
     loaded_plugins.clear()
+    loaded_plugin_names.clear()
+    loaded_plugin_info.clear()
+    loaded_plugin_modules.clear()
     plugin_errors.clear()
     plugin_manager.reset()
     
@@ -1775,42 +1986,45 @@ async def load_plugins():
         
         module_name = os.path.splitext(filename)[0]
         module_path = os.path.join(PLUGINS_DIR, filename)
-        full_module_name = f"plugins.{module_name}"
-        
-        try:
-            spec = importlib.util.spec_from_file_location(full_module_name, module_path)
-            if spec is None or spec.loader is None:
-                plugin_errors[module_name] = "Failed to load module spec"
-                continue
-            
-            module = importlib.util.module_from_spec(spec)
-            sys.modules[full_module_name] = module
-            spec.loader.exec_module(module)
-            
-            plugin_info = getattr(module, "PLUGIN_INFO", None)
-            plugin_name = plugin_info.get("name") if isinstance(plugin_info, dict) else module_name
+        await _load_plugin_module(module_name, module_path)
 
-            if hasattr(module, "register_hooks"):
-                hooks = plugin_manager.hooks_for(plugin_name, plugin_info if isinstance(plugin_info, dict) else None)
-                result = module.register_hooks(hooks)
-                if asyncio.iscoroutine(result):
-                    await result
+async def reload_plugin(plugin_identifier: str) -> Tuple[bool, str]:
+    """Reload a single plugin by module name or PLUGIN_INFO name."""
+    module_name = resolve_plugin_module_name(plugin_identifier)
+    candidate = plugin_identifier
+    if not module_name and candidate:
+        if candidate.endswith(".py"):
+            candidate = os.path.splitext(candidate)[0]
+        module_path = os.path.join(PLUGINS_DIR, f"{candidate}.py")
+        if os.path.exists(module_path):
+            module_name = candidate
+    if not module_name:
+        return False, f"Plugin '{plugin_identifier}' not found."
 
-            if hasattr(module, "register"):
-                result = module.register(tree, client)
-                if asyncio.iscoroutine(result):
-                    await result
-            elif hasattr(module, "setup"):
-                result = module.setup(tree, client)
-                if asyncio.iscoroutine(result):
-                    await result
-            elif not hasattr(module, "register_hooks"):
-                plugin_errors[module_name] = "No register(tree, client) or setup(tree, client) function found"
-                continue
-            
-            loaded_plugins[module_name] = module_path
-        except Exception as e:
-            plugin_errors[module_name] = str(e)
+    module_path = loaded_plugins.get(module_name) or os.path.join(PLUGINS_DIR, f"{module_name}.py")
+    if not os.path.exists(module_path):
+        return False, f"Plugin file not found: {module_path}"
+
+    plugin_name = loaded_plugin_names.get(module_name, module_name)
+    existing_module = loaded_plugin_modules.get(module_name)
+    if existing_module:
+        cleanup = getattr(existing_module, "on_unload", None) or getattr(existing_module, "cleanup", None)
+        if callable(cleanup):
+            result = cleanup()
+            if asyncio.iscoroutine(result):
+                await result
+
+    plugin_manager.unregister_plugin(plugin_name)
+    loaded_plugins.pop(module_name, None)
+    loaded_plugin_names.pop(module_name, None)
+    loaded_plugin_info.pop(module_name, None)
+    loaded_plugin_modules.pop(module_name, None)
+    plugin_errors.pop(module_name, None)
+
+    success = await _load_plugin_module(module_name, module_path)
+    if success:
+        return True, f"Reloaded plugin '{module_name}'."
+    return False, plugin_errors.get(module_name, f"Failed to reload plugin '{module_name}'.")
 
 def format_duration(seconds: float) -> str:
     """Format seconds into a human-readable duration."""
@@ -3494,54 +3708,61 @@ async def add_to_history(channel_id: int, role: str, content: str, user_id: int 
         
         # Process images if provider supports them
         if provider_name in ["claude", "gemini", "openai", "custom"]:
-            # Check if the current model supports vision
-            supports_vision = False
-            if provider_name == "claude":
-                # Claude models generally support vision
-                supports_vision = True
-            elif provider_name == "gemini":
-                # Gemini models support vision
-                supports_vision = True
-            elif provider_name == "openai":
-                # Check specific OpenAI models
-                current_model = None
-                try:
-                    if is_dm and user_id:
-                        selected_guild_id = dm_server_selection.get(user_id)
-                        if selected_guild_id:
-                            _, current_model = ai_manager.get_guild_settings(selected_guild_id)
-                        elif guild_id:
-                            _, current_model = ai_manager.get_guild_settings(guild_id)
+            # Resolve current model + custom URL for capability checks
+            current_model = None
+            custom_url = None
+            try:
+                if is_dm and user_id:
+                    selected_guild_id = dm_server_selection.get(user_id)
+                    if selected_guild_id:
+                        _, current_model = ai_manager.get_guild_settings(selected_guild_id)
+                        if provider_name == "custom":
+                            custom_url = ai_manager.get_guild_custom_url(selected_guild_id)
                     elif guild_id:
                         _, current_model = ai_manager.get_guild_settings(guild_id)
-                    
-                    if current_model:
-                        vision_models = ["gpt-5", "gpt-5-chat-latest", "gpt-4o", "gpt-4o-mini", "gpt-4-turbo", "gpt-4-vision-preview", "gpt-4.1", "gpt-4.1-mini"]
-                        supports_vision = any(vision_model in current_model.lower() for vision_model in vision_models)
-                except:
-                    supports_vision = False
-            elif provider_name == "custom":
-                # For custom providers, we check dynamically
+                        if provider_name == "custom":
+                            custom_url = ai_manager.get_guild_custom_url(guild_id)
+                elif guild_id:
+                    _, current_model = ai_manager.get_guild_settings(guild_id)
+                    if provider_name == "custom":
+                        custom_url = ai_manager.get_guild_custom_url(guild_id)
+            except Exception:
                 current_model = None
-                try:
-                    if is_dm and user_id:
-                        selected_guild_id = dm_server_selection.get(user_id)
-                        if selected_guild_id:
-                            _, current_model = ai_manager.get_guild_settings(selected_guild_id)
-                        elif guild_id:
-                            _, current_model = ai_manager.get_guild_settings(guild_id)
-                    elif guild_id:
-                        _, current_model = ai_manager.get_guild_settings(guild_id)
-                    
-                    if current_model:
-                        # Use the dynamic vision check for custom providers
-                        custom_provider = ai_manager.providers.get("custom")
-                        if custom_provider and hasattr(custom_provider, 'supports_vision_dynamic'):
+
+            # Check stored capabilities first
+            supports_vision = None
+            if current_model:
+                cap_entry = get_model_capabilities(provider_name, current_model, custom_url)
+                if "supports_vision" in cap_entry:
+                    supports_vision = bool(cap_entry.get("supports_vision"))
+
+            # Fallback to heuristics or explicit probes
+            if supports_vision is None:
+                if provider_name == "claude":
+                    supports_vision = True
+                elif provider_name == "gemini":
+                    supports_vision = True
+                elif provider_name == "openai":
+                    supports_vision = infer_vision_support(provider_name, current_model) if current_model else False
+                elif provider_name == "custom":
+                    if current_model and is_probe_allowed(provider_name, current_model, custom_url):
+                        custom_provider = ai_manager.get_custom_provider(custom_url) if custom_url else ai_manager.providers.get("custom")
+                        if custom_provider and hasattr(custom_provider, "supports_vision_dynamic"):
                             supports_vision = await custom_provider.supports_vision_dynamic(current_model)
+                            update_model_capabilities(
+                                provider_name,
+                                current_model,
+                                custom_url=custom_url,
+                                supports_vision=supports_vision,
+                                source="probe"
+                            )
                         else:
                             supports_vision = False
-                except:
-                    supports_vision = False
+                    else:
+                        supports_vision = True
+
+            if supports_vision is None:
+                supports_vision = False
             
             if supports_vision:
                 image_parts = []
@@ -4399,6 +4620,30 @@ async def generate_response(channel_id: int, user_message: str, guild: discord.G
         # Resolve provider context (for plugins / curator)
         provider_name, model_name, custom_url = resolve_provider_context(guild_id, user_id, is_dm)
 
+        # Optional capability probe on first use (explicitly allowed only)
+        if provider_name == "custom" and model_name and is_probe_allowed(provider_name, model_name, custom_url):
+            cap_entry = get_model_capabilities(provider_name, model_name, custom_url)
+            needs_reasoning = "supports_reasoning" not in cap_entry
+            needs_vision = "supports_vision" not in cap_entry
+            if needs_reasoning or needs_vision:
+                probe_results = await probe_model_capabilities(provider_name, model_name, custom_url)
+                if probe_results.get("supports_reasoning") is not None:
+                    update_model_capabilities(
+                        provider_name,
+                        model_name,
+                        custom_url=custom_url,
+                        supports_reasoning=probe_results.get("supports_reasoning"),
+                        source="probe"
+                    )
+                if probe_results.get("supports_vision") is not None:
+                    update_model_capabilities(
+                        provider_name,
+                        model_name,
+                        custom_url=custom_url,
+                        supports_vision=probe_results.get("supports_vision"),
+                        source="probe"
+                    )
+
         # Resolve persona lore for curator use (not injected into main prompt)
         persona_lore = get_persona_lore_for_context(guild_id, user_id, is_dm)
 
@@ -4460,6 +4705,21 @@ async def generate_response(channel_id: int, user_message: str, guild: discord.G
         reasoning_enabled = is_reasoning_enabled(guild_id, user_id, is_dm)
         reasoning_effort = get_reasoning_effort(guild_id, user_id, is_dm)
         reasoning_payload = {"effort": reasoning_effort} if reasoning_enabled else None
+
+        cap_entry = get_model_capabilities(provider_name, model_name, custom_url)
+        if cap_entry.get("supports_reasoning") is False:
+            reasoning_enabled = False
+            reasoning_payload = None
+
+        has_image_attachments = False
+        if attachments:
+            for attachment in attachments:
+                if attachment and isinstance(attachment.filename, str):
+                    lower_name = attachment.filename.lower()
+                    if lower_name.endswith((".png", ".jpg", ".jpeg", ".gif", ".webp")):
+                        has_image_attachments = True
+                        break
+        vision_unsupported = bool(has_image_attachments and cap_entry.get("supports_vision") is False)
 
         max_tokens = 8192
 
@@ -4540,6 +4800,9 @@ Never output only thinking tags or internal analysis; always provide a final rep
             system_message_content += "\n\nReasoning mode is enabled. Do NOT reveal chain-of-thought or internal planning. Do NOT narrate your process (no 'first', 'I need to', 'let me think'). Provide only the final reply. If information is missing, ask one short clarifying question."
         else:
             system_message_content += "\n\nIf reasoning is needed, provide a brief high-level explanation when helpful, without step-by-step chain-of-thought or internal planning."
+
+        if vision_unsupported:
+            system_message_content += "\n\nIMPORTANT: The current model cannot view images. Respond in-character saying you can’t see the image and ask the user to describe it."
 
         system_message_content += """
 
@@ -4827,6 +5090,24 @@ async def generate_memory_summary(channel_id: int, num_messages: int, guild: dis
         # Format messages with proper speaker attribution
         formatted_messages = []
         is_dm = not bool(guild)
+        low_effort_words = {
+            "ok", "okay", "k", "lol", "lmao", "lmfao", "thx", "thanks", "ty",
+            "yup", "nope", "idk", "brb", "gtg", "sure", "cool", "nice", "hmm", "meh"
+        }
+
+        def is_low_effort(text: str) -> bool:
+            if not text:
+                return True
+            tokens = re.findall(r"[a-z0-9']+", text.lower())
+            if not tokens:
+                return True
+            if len(tokens) <= 2 and all(token in low_effort_words for token in tokens):
+                return True
+            if len(tokens) <= 3 and len("".join(tokens)) <= 6 and "?" not in text:
+                return True
+            if len(text.strip()) < 6 and "?" not in text:
+                return True
+            return False
         
         for msg in recent_messages:
             try:
@@ -4834,6 +5115,8 @@ async def generate_memory_summary(channel_id: int, num_messages: int, guild: dis
                 role = msg.get("role")
                 
                 if isinstance(content, str) and content.strip():
+                    if is_low_effort(content):
+                        continue
                     if role == "assistant":
                         # Bot's message
                         formatted_messages.append(f"{current_persona}: {content}")
@@ -4876,6 +5159,8 @@ async def generate_memory_summary(channel_id: int, num_messages: int, guild: dis
                     
                     if text_parts:
                         combined_text = "\n".join(text_parts)
+                        if is_low_effort(combined_text):
+                            continue
                         if role == "assistant":
                             formatted_messages.append(f"{current_persona}: {combined_text}")
                         else:
@@ -4893,16 +5178,19 @@ async def generate_memory_summary(channel_id: int, num_messages: int, guild: dis
         
         conversation_text = "\n".join(formatted_messages)
         
-        memory_system_prompt = f"""Create a short memory summary of a Discord conversation for future reference.
+        memory_system_prompt = f"""You are writing a long-term memory for a Discord persona.
 
-<instructions>You must always follow these instructions:
-- Include users who participated in the exchange and mention if this was a DM conversation or channel conversation.
-- When referencing the AI's messages, refer to the bot as "{current_persona}" (this is their current persona/character name).
-- Focus only on the most important topics, information, decisions, announcements, or shifts in relationships shared.
-- Format it in a way that makes it easy to recall later on and use as a reminder.
-- Preserve the context of who said what in your summary.
-FORMAT: Create a single, concise summary up to 300 tokens in the form of a few (2-3) short paragraphs.
-IMPORTANT: The bot is {current_persona}, not "AI Assistant" or "the bot".</instructions>"""
+<instructions>
+- Write what {current_persona} should remember for future conversations.
+- Prioritize durable facts: plans/commitments, decisions, preferences, ongoing projects, relationship shifts, recurring topics.
+- If multiple threads exist, focus on the main thread; include side threads only if unresolved or likely to matter later.
+- Exclude transient chatter, jokes, resolved technical issues, one-off questions, and small talk.
+- Mention key participants and who committed to what.
+- Note whether this was a DM or a channel conversation.
+- Do not invent details or infer beyond the conversation text.
+- Use 3-6 short bullet points, max 120 words total.
+- Refer to the persona as "{current_persona}" when needed. Do not call it "AI Assistant" or "the bot".
+</instructions>"""
         
         # Use appropriate guild ID for temperature
         temp_guild_id = guild.id if guild else (dm_server_selection.get(user_id) if user_id else None)
