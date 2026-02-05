@@ -15,7 +15,7 @@ PLUGIN_KEY = "curated_context"
 LEGACY_KEY = "context_awareness"
 
 PLUGIN_INFO = {
-    "name": PLUGIN_KEY,
+    "name": "Curator",
     "version": "0.2.0",
     "priority": 50
 }

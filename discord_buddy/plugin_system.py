@@ -59,10 +59,62 @@ class PluginManager:
         self._order_counter += 1
         self._hooks[hook_name].append(HookEntry(priority=priority, order=self._order_counter, func=func, plugin_name=plugin_name))
 
+    def unregister_plugin(self, plugin_name: str) -> None:
+        """Remove all hooks registered by a specific plugin."""
+        for hook_name, entries in list(self._hooks.items()):
+            filtered = [entry for entry in entries if entry.plugin_name != plugin_name]
+            if filtered:
+                self._hooks[hook_name] = filtered
+            else:
+                self._hooks.pop(hook_name, None)
+
+    def _normalize_payload(self, hook_name: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+        """Ensure common payload keys exist to reduce plugin boilerplate."""
+        if not isinstance(payload, dict):
+            return {}
+
+        def ensure_list(key: str) -> None:
+            value = payload.get(key)
+            if isinstance(value, list):
+                return
+            payload[key] = []
+
+        def ensure_str(key: str) -> None:
+            value = payload.get(key)
+            if isinstance(value, str):
+                return
+            payload[key] = "" if value is None else str(value)
+
+        if hook_name == "context_build":
+            ensure_list("context_blocks")
+            ensure_list("history")
+            ensure_list("attachments")
+            ensure_str("user_message")
+            payload.setdefault("memory_override", "")
+            payload.setdefault("provider_name", None)
+            payload.setdefault("model_name", None)
+            payload.setdefault("custom_url", None)
+        elif hook_name == "before_generate":
+            ensure_list("context_blocks")
+            ensure_list("history")
+            ensure_str("system_prompt")
+            ensure_str("user_message")
+            payload.setdefault("temperature", None)
+            payload.setdefault("reasoning", None)
+            payload.setdefault("max_tokens", None)
+        elif hook_name == "after_generate":
+            ensure_list("history")
+            ensure_str("system_prompt")
+            ensure_str("user_message")
+            ensure_str("response")
+
+        return payload
+
     async def run_hook(self, hook_name: str, payload: Dict[str, Any]) -> Dict[str, Any]:
         hooks = self._hooks.get(hook_name, [])
         if not hooks:
             return payload
+        payload = self._normalize_payload(hook_name, payload)
         for entry in sorted(hooks):
             try:
                 result = entry.func(payload)

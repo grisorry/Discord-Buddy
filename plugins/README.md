@@ -93,3 +93,4 @@ Structure:
 - Hooks run in priority order (lower number first).
 - Hook errors are isolated and won't crash the bot.
 - Plugins can still define `register(tree, client)` or `setup(tree, client)` for slash commands.
+- Common payload keys (like `context_blocks`, `history`, `system_prompt`, `response`) are normalized before hooks run.
