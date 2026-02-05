@@ -137,6 +137,7 @@ DM_LAST_INTERACTION_FILE = os.path.join(DATA_DIR, "dm_last_interaction.json")
 DM_LORE_FILE = os.path.join(DATA_DIR, "dm_lore.json")
 DM_MEMORIES_FILE = os.path.join(DATA_DIR, "dm_memories.json")
 PERSONALITIES_FILE = os.path.join(DATA_DIR, "personalities.json")
+PERSONALITY_BACKUP_FILE = os.path.join(DATA_DIR, "personality_backups.json")
 HISTORY_LENGTHS_FILE = os.path.join(DATA_DIR, "history_lengths.json")
 LORE_FILE = os.path.join(DATA_DIR, "lore.json")
 ACTIVITY_FILE = os.path.join(DATA_DIR, "activity.json")
@@ -774,6 +775,82 @@ def resolve_provider_context(guild_id: int, user_id: Optional[int], is_dm: bool)
     except Exception:
         pass
     return provider_name, model_name, custom_url
+
+def get_processing_reasoning_payload(guild_id: Optional[int], user_id: Optional[int], is_dm: bool, effort: str = "high") -> Optional[Dict[str, str]]:
+    """Return a reasoning payload when supported; otherwise None."""
+    provider_name, model_name, custom_url = resolve_provider_context(guild_id, user_id, is_dm)
+    if not provider_name or not model_name:
+        return None
+    cap_func = globals().get("get_model_capabilities")
+    if cap_func:
+        cap_entry = cap_func(provider_name, model_name, custom_url)
+        if cap_entry.get("supports_reasoning") is False:
+            return None
+    return {"effort": effort}
+
+async def split_personality_with_llm(personality_text: str, guild_id: Optional[int], user_id: Optional[int], is_dm: bool) -> Tuple[str, str]:
+    """Split a personality prompt into bare persona and lore using the active model."""
+    base_text = (personality_text or "").strip()
+    if not base_text:
+        return "", ""
+
+    reasoning_payload = get_processing_reasoning_payload(guild_id, user_id, is_dm, effort="high")
+
+    persona_system = (
+        "You are distilling a character prompt into ONLY the bare personality. "
+        "Return personality traits, temperament, values, speech style, behavioral patterns, boundaries, and motivations. "
+        "Exclude all lore: no backstory, worldbuilding, powers, timelines, affiliations, locations, items, or relationships. "
+        "Avoid theme words or motifs (e.g., 'flame', 'burn', 'ice', 'shadow') unless they are essential to how they behave. "
+        "Do not mention the word 'lore'. Return 1-2 short paragraphs, plain text only, no headings or bullets."
+    )
+
+    lore_system = (
+        "You are extracting ONLY the character lore from a prompt. "
+        "Return backstory, world details, timeline events, affiliations, powers, important items, and relationships. "
+        "Do NOT include personality traits, tone, speech style, or behavioral guidance. "
+        "If there is no lore, respond with 'None.' only."
+    )
+
+    bare_persona = await ai_manager.generate_response(
+        messages=[{"role": "user", "content": base_text}],
+        system_prompt=persona_system,
+        temperature=0.2,
+        guild_id=guild_id,
+        is_dm=is_dm,
+        user_id=user_id,
+        max_tokens=700,
+        reasoning=reasoning_payload
+    )
+
+    lore = await ai_manager.generate_response(
+        messages=[{"role": "user", "content": base_text}],
+        system_prompt=lore_system,
+        temperature=0.2,
+        guild_id=guild_id,
+        is_dm=is_dm,
+        user_id=user_id,
+        max_tokens=900,
+        reasoning=reasoning_payload
+    )
+
+    if isinstance(bare_persona, str):
+        bare_persona = bare_persona.strip()
+    else:
+        bare_persona = ""
+
+    if isinstance(lore, str):
+        lore = lore.strip()
+        if lore.lower() in ("none", "none."):
+            lore = ""
+    else:
+        lore = ""
+
+    if bare_persona.startswith(("❌", "?")):
+        bare_persona = ""
+    if lore.startswith(("❌", "?")):
+        lore = ""
+
+    return bare_persona, lore
 
 # Remove all existing system prompts - they will be replaced with the new structure
 
@@ -1767,6 +1844,33 @@ def load_personalities():
     custom_perss = {int(k): v for k, v in data.get("custom_personalities", {}).items()}
     return guild_perss, custom_perss
 
+def load_personality_backups() -> Dict[str, Dict[str, List[Dict[str, Any]]]]:
+    """Load personality backups from file."""
+    data = load_json_data(PERSONALITY_BACKUP_FILE, convert_keys=False)
+    return data if isinstance(data, dict) else {}
+
+def save_personality_backups(backups: Dict[str, Dict[str, List[Dict[str, Any]]]]) -> None:
+    """Save personality backups to file."""
+    save_json_data(PERSONALITY_BACKUP_FILE, backups, convert_keys=False)
+
+def backup_personality_snapshot(guild_id: int, personality_key: str, entry: Dict[str, Any], note: str = "") -> None:
+    """Backup a personality entry before modification."""
+    try:
+        backups = load_personality_backups()
+        guild_key = str(guild_id)
+        if guild_key not in backups:
+            backups[guild_key] = {}
+        if personality_key not in backups[guild_key]:
+            backups[guild_key][personality_key] = []
+        backups[guild_key][personality_key].append({
+            "timestamp": int(time.time()),
+            "note": note,
+            "entry": entry
+        })
+        save_personality_backups(backups)
+    except Exception:
+        pass
+
 def get_shared_guild(user_id: int) -> discord.Guild:
     """Get a guild that both the bot and user are members of"""
     user = client.get_user(user_id)
@@ -1782,6 +1886,30 @@ def get_shared_guild(user_id: int) -> discord.Guild:
             return guild
     
     return None
+
+def resolve_personality_context(guild_id: Optional[int], user_id: Optional[int], is_dm: bool) -> Tuple[Optional[int], str]:
+    """Resolve the active personality context for the current request."""
+    if is_dm and user_id:
+        if user_id in dm_manager.dm_personalities:
+            preferred_guild_id, preferred_personality = dm_manager.dm_personalities[user_id]
+            return preferred_guild_id, preferred_personality
+        selected_guild_id = dm_server_selection.get(user_id)
+        if selected_guild_id:
+            return selected_guild_id, guild_personalities.get(selected_guild_id, "default")
+        shared_guild = get_shared_guild(user_id)
+        if shared_guild:
+            return shared_guild.id, guild_personalities.get(shared_guild.id, "default")
+        return None, "default"
+    return guild_id, guild_personalities.get(guild_id, "default") if guild_id else "default"
+
+def get_persona_lore_for_context(guild_id: Optional[int], user_id: Optional[int], is_dm: bool) -> str:
+    """Get persona lore for curator use without injecting into the main system prompt."""
+    resolved_guild_id, personality_name = resolve_personality_context(guild_id, user_id, is_dm)
+    if resolved_guild_id and resolved_guild_id in custom_personalities and personality_name in custom_personalities[resolved_guild_id]:
+        lore = custom_personalities[resolved_guild_id][personality_name].get("lore", "")
+        return lore if isinstance(lore, str) else ""
+    lore = DEFAULT_PERSONALITIES.get("default", {}).get("lore", "")
+    return lore if isinstance(lore, str) else ""
 
 async def get_shared_guild_async(user_id: int) -> discord.Guild:
     """Async version that can fetch member if not in cache"""
@@ -3956,14 +4084,8 @@ def get_system_prompt(guild_id: int, guild: discord.Guild = None, query: str = N
     persona_description = apply_template_placeholders(persona_description, bot_persona_name, username)
 
     # Build the new Anthropic-style system prompt
+    # Lore is handled by the curator and injected only when relevant.
     persona_lore_block = ""
-    if isinstance(persona_lore, str) and persona_lore.strip():
-        persona_lore_block = (
-            "\nHere is character lore. Use it only if the user asks about it or it is necessary:\n"
-            "<character_lore>\n"
-            f"{persona_lore.strip()}\n"
-            "</character_lore>"
-        )
 
     persona_examples_block = ""
     if isinstance(persona_examples, str) and persona_examples.strip():
@@ -4277,6 +4399,9 @@ async def generate_response(channel_id: int, user_message: str, guild: discord.G
         # Resolve provider context (for plugins / curator)
         provider_name, model_name, custom_url = resolve_provider_context(guild_id, user_id, is_dm)
 
+        # Resolve persona lore for curator use (not injected into main prompt)
+        persona_lore = get_persona_lore_for_context(guild_id, user_id, is_dm)
+
         # Plugin hook: context build / curation
         context_payload = {
             "channel_id": channel_id,
@@ -4296,6 +4421,7 @@ async def generate_response(channel_id: int, user_message: str, guild: discord.G
             "provider_name": provider_name,
             "model_name": model_name,
             "custom_url": custom_url,
+            "persona_lore": persona_lore,
         }
         context_payload = await plugin_manager.run_hook("context_build", context_payload)
         history = context_payload.get("history", history)

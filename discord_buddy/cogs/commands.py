@@ -4,6 +4,7 @@ from discord import app_commands
 from discord.ext import commands
 from discord_buddy.core import *
 
+MAX_PERSONALITY_FILE_BYTES = 128 * 1024  # 128KB
 
 class CommandsCog(commands.Cog):
     def __init__(self, bot: commands.Bot):
@@ -625,7 +626,7 @@ class CommandsCog(commands.Cog):
     
         embed.add_field(
             name="🎭 Personality Commands",
-            value="`/personality_create <name> <display_name> <prompt>` - Create custom personality for the bot (Admin only)\n`/personality_import <file> [name] [display_name]` - Import personality from .txt (Admin only)\n`/personality_lore_set <personality> [lore_text] [lore_file]` - Set character lore (Admin only)\n`/personality_set [name]` - Set/view the bot's active personality (Admin only)\n`/personality_list` - List all personalities of the bot\n`/personality_edit <name> [display_name] [prompt]` - Edit personality (Admin only)\n`/personality_delete <name>` - Delete personality (Admin only)",
+            value="`/personality_create <name> <display_name> <prompt>` - Create custom personality for the bot (Admin only)\n`/personality_import <file> [name] [display_name]` - Import personality from .txt (Admin only)\n`/personality_split <personality>` - Separate prompt into bare personality + lore (Admin only)\n`/personality_lore <personality> [lore_text] [lore_file]` - Set character lore (Admin only)\n`/personality_set [name]` - Set/view the bot's active personality (Admin only)\n`/personality_list` - List all personalities of the bot\n`/personality_edit <name> [display_name] [prompt]` - Edit personality (Admin only)\n`/personality_delete <name>` - Delete personality (Admin only)",
             inline=False
         )
     
@@ -1244,9 +1245,13 @@ class CommandsCog(commands.Cog):
         save_personalities()
     
         prompt_preview = personality_prompt[:100] + ('...' if len(personality_prompt) > 100 else '')
-        await interaction.followup.send(f"✅ Created personality **{display_name}** (`{clean_name}`)!\n"
-                                       f"Use `/personality_set {clean_name}` to activate it.\n\n"
-                                       f"**Prompt preview:** {prompt_preview}")
+        await interaction.followup.send(
+            f"✅ Created personality **{display_name}** (`{clean_name}`)!\n"
+            f"Use `/personality_set {clean_name}` to activate it.\n\n"
+            f"⚠️ **Reminder:** Personality prompts should be the bare person only (no lore). "
+            f"If you included lore, run `/personality_split {clean_name}` to separate it.\n\n"
+            f"**Prompt preview:** {prompt_preview}"
+        )
 
     @app_commands.command(name="personality_import", description="Import a personality from a .txt file (Admin only)")
     async def import_personality(self, interaction: discord.Interaction, file: discord.Attachment, name: str = None, display_name: str = None):
@@ -1263,6 +1268,9 @@ class CommandsCog(commands.Cog):
 
         if not file or not file.filename.lower().endswith(".txt"):
             await interaction.followup.send("❌ Please upload a valid .txt file.")
+            return
+        if file.size and file.size > MAX_PERSONALITY_FILE_BYTES:
+            await interaction.followup.send("❌ Personality file is too large. Please keep it under 128KB.")
             return
 
         # Read file content
@@ -1319,14 +1327,13 @@ class CommandsCog(commands.Cog):
         await interaction.followup.send(
             f"✅ Imported personality **{display_name}** (`{clean_name}`) from `{file.filename}`!\n"
             f"Use `/personality_set {clean_name}` to activate it.\n\n"
+            f"⚠️ **Reminder:** Personality prompts should be the bare person only (no lore). "
+            f"If you included lore, run `/personality_split {clean_name}` to separate it.\n\n"
             f"**Prompt preview:** {prompt_preview}"
         )
 
-    @app_commands.command(name="personality_lore_set", description="Set character lore for a personality (Admin only)")
-    async def personality_lore_set(self, interaction: discord.Interaction, personality_name: str, lore_text: str = None, lore_file: discord.Attachment = None):
-        """Set character lore for a personality"""
-        await interaction.response.defer(ephemeral=True)
-
+    async def _set_personality_lore(self, interaction: discord.Interaction, personality_name: str, lore_text: str = None, lore_file: discord.Attachment = None):
+        """Helper: set character lore for a personality."""
         if not interaction.guild:
             await interaction.followup.send("Character lore can only be set in servers, not DMs.")
             return
@@ -1344,6 +1351,9 @@ class CommandsCog(commands.Cog):
         if lore_file is not None:
             if not lore_file.filename.lower().endswith(".txt"):
                 await interaction.followup.send("❌ Please upload a valid .txt file for lore.")
+                return
+            if lore_file.size and lore_file.size > MAX_PERSONALITY_FILE_BYTES:
+                await interaction.followup.send("❌ Lore file is too large. Please keep it under 128KB.")
                 return
             try:
                 raw_bytes = await lore_file.read()
@@ -1369,6 +1379,85 @@ class CommandsCog(commands.Cog):
         await interaction.followup.send(
             f"✅ Character lore set for **{custom_personalities[interaction.guild.id][clean_name]['name']}** (`{clean_name}`)!\n"
             f"**Lore preview:** {lore_preview}"
+        )
+
+    @app_commands.command(name="personality_lore", description="Set character lore for a personality (Admin only)")
+    async def personality_lore(self, interaction: discord.Interaction, personality_name: str, lore_text: str = None, lore_file: discord.Attachment = None):
+        """Set character lore for a personality"""
+        await interaction.response.defer(ephemeral=True)
+        await self._set_personality_lore(interaction, personality_name, lore_text, lore_file)
+
+    @app_commands.command(name="personality_lore_set", description="Set character lore for a personality (Admin only)")
+    async def personality_lore_set(self, interaction: discord.Interaction, personality_name: str, lore_text: str = None, lore_file: discord.Attachment = None):
+        """Set character lore for a personality"""
+        await interaction.response.defer(ephemeral=True)
+        await self._set_personality_lore(interaction, personality_name, lore_text, lore_file)
+
+    @app_commands.command(name="personality_split", description="Split a personality into bare persona + lore (Admin only)")
+    async def personality_split(self, interaction: discord.Interaction, personality_name: str):
+        """Split an existing personality prompt into bare personality and lore."""
+        await interaction.response.defer(ephemeral=True)
+
+        if not interaction.guild:
+            await interaction.followup.send("Personality splitting can only be used in servers.")
+            return
+
+        if not check_admin_permissions(interaction):
+            await interaction.followup.send("❌ Only administrators can split personalities!")
+            return
+
+        clean_name = personality_name.lower().replace(" ", "_")
+        if interaction.guild.id not in custom_personalities or clean_name not in custom_personalities[interaction.guild.id]:
+            await interaction.followup.send(f"Personality '{clean_name}' not found! Use `/personality_list` to see available personalities.")
+            return
+
+        entry = custom_personalities[interaction.guild.id][clean_name]
+        original_prompt = entry.get("prompt", "")
+        original_lore = entry.get("lore", "")
+
+        if not original_prompt or not isinstance(original_prompt, str):
+            await interaction.followup.send("❌ This personality has no prompt to split.")
+            return
+
+        backup_personality_snapshot(
+            interaction.guild.id,
+            clean_name,
+            {
+                "name": entry.get("name"),
+                "prompt": original_prompt,
+                "lore": original_lore,
+                "examples": entry.get("examples", "")
+            },
+            note="pre-split"
+        )
+
+        await interaction.followup.send("🧩 Processing personality split... This can take a moment.")
+
+        bare_persona, lore = await split_personality_with_llm(
+            original_prompt,
+            guild_id=interaction.guild.id,
+            user_id=interaction.user.id,
+            is_dm=False
+        )
+
+        if not bare_persona:
+            await interaction.followup.send("❌ Failed to extract a bare personality. Try rephrasing the prompt and retry.")
+            return
+
+        entry["prompt"] = bare_persona
+        if lore:
+            entry["lore"] = lore
+
+        save_personalities()
+
+        prompt_preview = bare_persona[:120] + ('...' if len(bare_persona) > 120 else '')
+        lore_preview = lore[:120] + ('...' if len(lore) > 120 else '') if lore else "None"
+
+        await interaction.followup.send(
+            f"✅ Personality split complete for **{entry.get('name', clean_name)}** (`{clean_name}`)!\n"
+            f"**Bare personality preview:** {prompt_preview}\n"
+            f"**Lore preview:** {lore_preview}\n"
+            f"Backup saved to `{PERSONALITY_BACKUP_FILE}`."
         )
 
     @app_commands.command(name="personality_set", description="Set the active personality for this server (Admin only)")

@@ -203,6 +203,7 @@ def register_hooks(hooks):
         provider_name = payload.get("provider_name")
         model_name = payload.get("model_name")
         custom_url = payload.get("custom_url")
+        persona_lore = str(payload.get("persona_lore") or "").strip()
         guild_id = payload.get("guild_id")
         autonomous_join = bool(payload.get("autonomous_join"))
 
@@ -301,8 +302,11 @@ def register_hooks(hooks):
             "If nothing is relevant, respond with 'None.'"
         )
 
+        lore_block = persona_lore if persona_lore else "None."
+
         curator_user = (
             f"Latest user message:\n{user_message}\n\n"
+            f"Character lore (reference):\n{lore_block}\n\n"
             f"Relevant memory:\n{memory_block}\n\n"
             f"Recent history:\n{history_text}\n"
         )

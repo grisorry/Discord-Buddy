@@ -51,6 +51,7 @@ All hooks receive a `payload` dict. Relevant keys include:
 
 `context_build`:
 - `history`, `memory_override`, `user_message`, `attachments`
+- `persona_lore` (character lore available to curator plugins)
 - `context_blocks` (append strings here)
 - `ai_manager`, `provider_name`, `model_name`, `custom_url`
 
