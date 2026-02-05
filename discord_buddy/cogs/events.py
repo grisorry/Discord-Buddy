@@ -1,7 +1,44 @@
 import asyncio
+import re
 import discord
 from discord.ext import commands
 from discord_buddy.core import *
+
+LOW_EFFORT_WORDS = {
+    "ok", "okay", "k", "lol", "lmao", "lmfao", "thx", "thanks", "ty",
+    "yup", "nope", "idk", "brb", "gtg", "sure", "cool", "nice", "hmm", "meh"
+}
+
+OPEN_TRIGGERS = (
+    "anyone", "anybody", "someone", "does anyone", "does anybody",
+    "can someone", "can anybody", "any tips", "any advice", "any suggestions",
+    "recommendations", "thoughts", "what do you think", "ideas", "help"
+)
+
+
+def _normalize_text(text: str) -> str:
+    return re.sub(r"\s+", " ", text or "").strip().lower()
+
+
+def _looks_open_question(text: str) -> bool:
+    if not text:
+        return False
+    if "?" in text:
+        return True
+    return any(phrase in text for phrase in OPEN_TRIGGERS)
+
+
+def _is_low_effort(text: str) -> bool:
+    if not text:
+        return True
+    words = re.findall(r"[a-z0-9']+", text)
+    if not words:
+        return True
+    if len(words) <= 2 and all(word in LOW_EFFORT_WORDS for word in words):
+        return True
+    if len(words) <= 3 and len("".join(words)) <= 6 and "?" not in text:
+        return True
+    return False
 
 
 class EventsCog(commands.Cog):
@@ -197,6 +234,32 @@ class EventsCog(commands.Cog):
               autonomous_manager.should_respond_autonomously(guild_id, message.channel.id)):
             should_respond = True
             autonomous_trigger = True
+
+        if should_respond and autonomous_trigger and not direct_trigger:
+            normalized = _normalize_text(message.content)
+            open_question = _looks_open_question(normalized)
+            low_effort = _is_low_effort(normalized)
+
+            replied_to_other = False
+            if message.reference and message.reference.resolved:
+                replied_to_other = True
+
+            mentions_other = False
+            if message.mentions:
+                mentions_other = any(m != client.user for m in message.mentions)
+
+            mention_everyone = bool(getattr(message, "mention_everyone", False))
+            mention_role = bool(getattr(message, "role_mentions", []))
+
+            if replied_to_other:
+                should_respond = False
+                autonomous_trigger = False
+            elif mentions_other and not (mention_everyone or mention_role):
+                should_respond = False
+                autonomous_trigger = False
+            elif low_effort and not (open_question or mention_everyone or mention_role):
+                should_respond = False
+                autonomous_trigger = False
 
         if should_respond:
             meta_tags = build_message_meta_tags(message)

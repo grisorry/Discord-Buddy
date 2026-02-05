@@ -3975,7 +3975,7 @@ def get_system_prompt(guild_id: int, guild: discord.Guild = None, query: str = N
         nsfw_enabled = guild_nsfw_settings.get(guild_id, False)
     
     # Base prompt structure
-        system_prompt = """You will be acting as a real person named {bot_persona_name}. Your goal is to autonomously chat with users on Discord. You will be replying to the users {location_text}, and they will be confused if you don't respond in character.
+    system_prompt = """You will be acting as a real person named {bot_persona_name}. Your goal is to autonomously chat with users on Discord. You will be replying to the users {location_text}, and they will be confused if you don't respond in character.
 
 Maintain a natural, informal, and conversational tone.
 

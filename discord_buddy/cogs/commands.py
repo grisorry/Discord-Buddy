@@ -3,7 +3,6 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 from discord_buddy.core import *
-from discord_buddy.plugin_system import get_plugin_guild_settings, update_plugin_guild_settings
 
 
 class CommandsCog(commands.Cog):
@@ -600,85 +599,6 @@ class CommandsCog(commands.Cog):
         embed.add_field(name="Processing This Channel", value="Yes" if processing else "No", inline=True)
     
         await interaction.followup.send(embed=embed)
-
-    # CONTEXT AWARENESS PLUGIN COMMANDS
-
-    @app_commands.command(name="context_plugin_info", description="Show Context Awareness plugin settings (Admin only)")
-    async def context_plugin_info(self, interaction: discord.Interaction):
-        await interaction.response.defer(ephemeral=True)
-        if not interaction.guild:
-            await interaction.followup.send("This command can only be used in servers.")
-            return
-        if not check_admin_permissions(interaction):
-            await interaction.followup.send("❌ Only administrators can use this command!")
-            return
-
-        defaults = {"enabled": True, "max_history": 20, "max_words": 120, "history_mode": "keep"}
-        settings = get_plugin_guild_settings("context_awareness", interaction.guild.id, defaults)
-
-        embed = discord.Embed(
-            title="🧠 Context Awareness Plugin",
-            color=0x0099ff
-        )
-        embed.add_field(name="Enabled", value=str(bool(settings.get("enabled", True))), inline=True)
-        embed.add_field(name="Max History", value=str(settings.get("max_history", defaults["max_history"])), inline=True)
-        embed.add_field(name="Max Words", value=str(settings.get("max_words", defaults["max_words"])), inline=True)
-        embed.add_field(name="History Mode", value=str(settings.get("history_mode", defaults["history_mode"])), inline=True)
-        await interaction.followup.send(embed=embed)
-
-    @app_commands.command(name="context_plugin_set", description="Configure Context Awareness plugin (Admin only)")
-    @app_commands.describe(
-        enabled="Enable or disable the context plugin",
-        max_history="How many recent messages to scan (1-80)",
-        max_words="Max words for the curated context (40-300)",
-        history_mode="History handling: keep | trim | curated_only"
-    )
-    async def context_plugin_set(
-        self,
-        interaction: discord.Interaction,
-        enabled: Optional[bool] = None,
-        max_history: Optional[int] = None,
-        max_words: Optional[int] = None,
-        history_mode: Optional[str] = None
-    ):
-        await interaction.response.defer(ephemeral=True)
-        if not interaction.guild:
-            await interaction.followup.send("This command can only be used in servers.")
-            return
-        if not check_admin_permissions(interaction):
-            await interaction.followup.send("❌ Only administrators can use this command!")
-            return
-
-        updates = {}
-        if enabled is not None:
-            updates["enabled"] = bool(enabled)
-        if max_history is not None:
-            updates["max_history"] = max(1, min(int(max_history), 80))
-        if max_words is not None:
-            updates["max_words"] = max(40, min(int(max_words), 300))
-        if history_mode is not None:
-            mode = str(history_mode).strip().lower()
-            if mode in ("keep", "trim", "curated_only"):
-                updates["history_mode"] = mode
-            else:
-                await interaction.followup.send("❌ Invalid history_mode. Use: keep | trim | curated_only.")
-                return
-
-        if not updates:
-            await interaction.followup.send("No changes provided. Use at least one option.")
-            return
-
-        update_plugin_guild_settings("context_awareness", interaction.guild.id, updates)
-
-        defaults = {"enabled": True, "max_history": 20, "max_words": 120, "history_mode": "keep"}
-        settings = get_plugin_guild_settings("context_awareness", interaction.guild.id, defaults)
-        await interaction.followup.send(
-            f"✅ Updated Context Awareness plugin settings: "
-            f"enabled={settings.get('enabled', True)}, "
-            f"max_history={settings.get('max_history', defaults['max_history'])}, "
-            f"max_words={settings.get('max_words', defaults['max_words'])}, "
-            f"history_mode={settings.get('history_mode', defaults['history_mode'])}"
-        )
 
     @app_commands.command(name="help", description="Show all available commands and how to use the bot")
     async def help_command(self, interaction: discord.Interaction):
