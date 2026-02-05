@@ -1872,15 +1872,17 @@ def build_message_meta_tags(message: discord.Message) -> List[str]:
         pass
     try:
         if message and message.reference and message.reference.resolved:
-            replied_author = message.reference.resolved.author
-            if replied_author == client.user:
-                tags.append("Replied to you")
-            elif hasattr(replied_author, "display_name") and replied_author.display_name:
-                tags.append(f"Replied to {replied_author.display_name}")
-            elif hasattr(replied_author, "global_name") and replied_author.global_name:
-                tags.append(f"Replied to {replied_author.global_name}")
-            else:
-                tags.append(f"Replied to {replied_author.name}")
+            replied_message = message.reference.resolved
+            replied_author = getattr(replied_message, "author", None)
+            if replied_author:
+                if replied_author == client.user:
+                    tags.append("Replied to you")
+                elif hasattr(replied_author, "display_name") and replied_author.display_name:
+                    tags.append(f"Replied to {replied_author.display_name}")
+                elif hasattr(replied_author, "global_name") and replied_author.global_name:
+                    tags.append(f"Replied to {replied_author.global_name}")
+                else:
+                    tags.append(f"Replied to {replied_author.name}")
     except Exception:
         pass
     try:
@@ -3630,12 +3632,14 @@ async def load_channel_history_from_discord(channel: discord.TextChannel, guild:
             reply_to_name = None
             if message.reference and message.reference.resolved:
                 replied_message = message.reference.resolved
-                if hasattr(replied_message.author, 'display_name') and replied_message.author.display_name:
-                    reply_to_name = replied_message.author.display_name
-                elif hasattr(replied_message.author, 'global_name') and replied_message.author.global_name:
-                    reply_to_name = replied_message.author.global_name
-                else:
-                    reply_to_name = replied_message.author.name
+                replied_author = getattr(replied_message, "author", None)
+                if replied_author:
+                    if hasattr(replied_author, 'display_name') and replied_author.display_name:
+                        reply_to_name = replied_author.display_name
+                    elif hasattr(replied_author, 'global_name') and replied_author.global_name:
+                        reply_to_name = replied_author.global_name
+                    else:
+                        reply_to_name = replied_author.name
             
             # Replace bot mention with bot's display name
             bot_display_name = guild.me.display_name if guild else client.user.display_name
@@ -4212,12 +4216,14 @@ async def generate_response(channel_id: int, user_message: str, guild: discord.G
         reply_to_name = None
         if original_message and original_message.reference and original_message.reference.resolved:
             replied_message = original_message.reference.resolved
-            if hasattr(replied_message.author, 'display_name') and replied_message.author.display_name:
-                reply_to_name = replied_message.author.display_name
-            elif hasattr(replied_message.author, 'global_name') and replied_message.author.global_name:
-                reply_to_name = replied_message.author.global_name
-            else:
-                reply_to_name = replied_message.author.name
+            replied_author = getattr(replied_message, "author", None)
+            if replied_author:
+                if hasattr(replied_author, 'display_name') and replied_author.display_name:
+                    reply_to_name = replied_author.display_name
+                elif hasattr(replied_author, 'global_name') and replied_author.global_name:
+                    reply_to_name = replied_author.global_name
+                else:
+                    reply_to_name = replied_author.name
 
         # Default message content fallback (will be replaced when add_to_history runs)
         message_content = user_message

@@ -172,12 +172,14 @@ class EventsCog(commands.Cog):
         reply_to_name = None
         if message.reference and message.reference.resolved:
             replied_message = message.reference.resolved
-            if hasattr(replied_message.author, 'display_name') and replied_message.author.display_name:
-                reply_to_name = replied_message.author.display_name
-            elif hasattr(replied_message.author, 'global_name') and replied_message.author.global_name:
-                reply_to_name = replied_message.author.global_name
-            else:
-                reply_to_name = replied_message.author.name
+            replied_author = getattr(replied_message, "author", None)
+            if replied_author:
+                if hasattr(replied_author, 'display_name') and replied_author.display_name:
+                    reply_to_name = replied_author.display_name
+                elif hasattr(replied_author, 'global_name') and replied_author.global_name:
+                    reply_to_name = replied_author.global_name
+                else:
+                    reply_to_name = replied_author.name
 
         guild_id = message.guild.id if message.guild else None
 
@@ -217,7 +219,8 @@ class EventsCog(commands.Cog):
         is_reply_to_bot = False
         if message.reference and message.reference.resolved:
             try:
-                is_reply_to_bot = message.reference.resolved.author == client.user
+                replied_author = getattr(message.reference.resolved, "author", None)
+                is_reply_to_bot = replied_author == client.user if replied_author else False
             except Exception:
                 is_reply_to_bot = False
     
