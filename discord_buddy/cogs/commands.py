@@ -2587,7 +2587,7 @@ class CommandsCog(commands.Cog):
             if not memory_summary:
                 await interaction.followup.send("❌ **Failed to generate memory summary: No response from AI**")
                 return
-            elif memory_summary.startswith("❌") or memory_summary.startswith("Error"):
+            elif memory_summary.startswith("❌") or memory_summary.startswith("Error") or "AI provider returned empty response" in memory_summary:
                 await interaction.followup.send(f"❌ **Failed to generate memory summary:**\n{memory_summary}")
                 return
         

@@ -2998,6 +2998,7 @@ dm_server_selection: Dict[int, int] = load_json_data(DM_SERVER_SELECTION_FILE)
 guild_dm_enabled: Dict[int, bool] = load_json_data(DM_ENABLED_FILE)
 bot_persona_name: str = "Assistant"
 recently_deleted_dm_messages: Dict[int, Set[int]] = {}
+consecutive_response_failures: int = 0
 def record_response_success() -> None:
     """Reset failure counter after a successful response."""
     global consecutive_response_failures
@@ -3883,6 +3884,12 @@ async def add_to_history(channel_id: int, role: str, content: str, user_id: int 
         if isinstance(conversations[channel_id][-1]["content"], str):
             existing_content = conversations[channel_id][-1]["content"] or ""
             conversations[channel_id][-1]["content"] = existing_content + f"\n{message_content}"
+            if meta_tags:
+                safe_tags = [tag.strip() for tag in meta_tags if isinstance(tag, str) and tag.strip()]
+                if safe_tags:
+                    existing_tags = conversations[channel_id][-1].get("meta_tags", [])
+                    merged_tags = list(dict.fromkeys(existing_tags + safe_tags))
+                    conversations[channel_id][-1]["meta_tags"] = merged_tags
         else:
             # Don't group if previous message has complex content
             # Ensure we store text-only in history
@@ -3898,6 +3905,10 @@ async def add_to_history(channel_id: int, role: str, content: str, user_id: int 
             entry = {"role": role, "content": text_content}
             if role == "user" and user_id:
                 entry["user_id"] = user_id
+            if meta_tags:
+                safe_tags = [tag.strip() for tag in meta_tags if isinstance(tag, str) and tag.strip()]
+                if safe_tags:
+                    entry["meta_tags"] = safe_tags
             conversations[channel_id].append(entry)
     else:
         # Create new message entry
@@ -3914,6 +3925,10 @@ async def add_to_history(channel_id: int, role: str, content: str, user_id: int 
         entry = {"role": role, "content": text_content}
         if role == "user" and user_id:
             entry["user_id"] = user_id
+        if meta_tags:
+            safe_tags = [tag.strip() for tag in meta_tags if isinstance(tag, str) and tag.strip()]
+            if safe_tags:
+                entry["meta_tags"] = safe_tags
         conversations[channel_id].append(entry)
 
     # Maintain history length limit
@@ -4305,8 +4320,16 @@ def get_system_prompt(guild_id: int, guild: discord.Guild = None, query: str = N
     persona_description = apply_template_placeholders(persona_description, bot_persona_name, username)
 
     # Build the new Anthropic-style system prompt
-    # Lore is handled by the curator and injected only when relevant.
+    # Lore is always available to the main system, but should only be used when relevant.
     persona_lore_block = ""
+    if isinstance(persona_lore, str) and persona_lore.strip():
+        persona_lore_text = apply_template_placeholders(persona_lore.strip(), bot_persona_name, username)
+        persona_lore_block = (
+            "\nHere is character lore. Use it only when the user asks about it or when it is clearly relevant:\n"
+            "<character_lore>\n"
+            f"{persona_lore_text}\n"
+            "</character_lore>"
+        )
 
     persona_examples_block = ""
     if isinstance(persona_examples, str) and persona_examples.strip():
@@ -5113,8 +5136,12 @@ async def generate_memory_summary(channel_id: int, num_messages: int, guild: dis
             try:
                 content = msg.get("content")
                 role = msg.get("role")
+                meta_tags = msg.get("meta_tags") or []
+                safe_meta = [tag.strip() for tag in meta_tags if isinstance(tag, str) and tag.strip()]
                 
                 if isinstance(content, str) and content.strip():
+                    if safe_meta and not any(tag in content for tag in safe_meta):
+                        content = f"{content} [Meta: {', '.join(safe_meta)}]"
                     if is_low_effort(content):
                         continue
                     if role == "assistant":
@@ -5159,6 +5186,8 @@ async def generate_memory_summary(channel_id: int, num_messages: int, guild: dis
                     
                     if text_parts:
                         combined_text = "\n".join(text_parts)
+                        if safe_meta and not any(tag in combined_text for tag in safe_meta):
+                            combined_text = f"{combined_text} [Meta: {', '.join(safe_meta)}]"
                         if is_low_effort(combined_text):
                             continue
                         if role == "assistant":
@@ -5198,6 +5227,14 @@ async def generate_memory_summary(channel_id: int, num_messages: int, guild: dis
             shared_guild = get_shared_guild(user_id)
             temp_guild_id = shared_guild.id if shared_guild else None
         
+        print(f"[memory] Generating summary: messages={len(formatted_messages)}, channel_id={channel_id}, guild_id={guild.id if guild else None}, is_dm={is_dm}")
+        try:
+            preview = conversation_text
+            if len(preview) > 1200:
+                preview = preview[:1200] + "\n...[truncated]"
+            print(f"[memory] Conversation preview:\n{preview}")
+        except Exception:
+            pass
         response = await ai_manager.generate_response(
             messages=[{"role": "user", "content": f"Create a memory summary of this Discord conversation:\n\n{conversation_text}"}],
             system_prompt=memory_system_prompt,
@@ -5207,10 +5244,11 @@ async def generate_memory_summary(channel_id: int, num_messages: int, guild: dis
             user_id=user_id,
             max_tokens=8192
         )
+        print(f"[memory] Provider response length: {len(response) if isinstance(response, str) else 'non-text'}")
         
-        # Check if response is None or error
-        if not response:
-            return "AI provider returned empty response"
+        # Check if response is None or empty
+        if not response or not str(response).strip():
+            return "❌ AI provider returned empty response"
         
         if response.startswith("❌"):
             return f"AI provider error: {response}"
