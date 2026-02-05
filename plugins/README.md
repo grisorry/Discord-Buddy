@@ -15,8 +15,19 @@ PLUGIN_INFO = {
 
 def register_hooks(hooks):
     async def on_context(payload):
-        payload["context_blocks"].append("Topic: ...")
+        payload["context_blocks"].append("Short context note.")
     hooks.on_context_build(on_context, priority=50)
+
+    async def on_before_generate(payload):
+        # Optional: inject context blocks into the system prompt
+        blocks = payload.get("context_blocks") or []
+        if not blocks:
+            return
+        system_prompt = payload.get("system_prompt", "")
+        injection = "\n\nPlugin notes:\n" + "\n".join(blocks)
+        payload["system_prompt"] = system_prompt + injection
+        return payload
+    hooks.on_before_generate(on_before_generate, priority=50)
 ```
 
 Reload the bot (or call `/sync`) and the plugin will load.
@@ -45,6 +56,7 @@ All hooks receive a `payload` dict. Relevant keys include:
 
 `before_generate`:
 - `system_prompt`, `history`, `temperature`, `reasoning`, `max_tokens`
+ - `context_blocks` (if your plugin wants to inject context)
 
 `after_generate`:
 - `response`, `system_prompt`, `history`, `user_message`
@@ -62,32 +74,19 @@ Structure:
 ```json
 {
   "plugins": {
-    "context_awareness": {
+    "my_plugin": {
       "default": {
-        "enabled": true,
-        "max_history": 20,
-        "max_words": 120,
-        "history_mode": "keep"
+        "enabled": true
       },
       "guilds": {
         "123456789012345678": {
-          "enabled": true,
-          "max_history": 25,
-          "max_words": 150,
-          "history_mode": "trim"
+          "enabled": false
         }
       }
     }
   }
 }
 ```
-
-The `context_awareness` plugin uses `/context_plugin_set` and `/context_plugin_info` for configuration.
-
-`history_mode` options:
-- `keep` (default): keep full history for the main model
-- `trim`: keep only the last `max_history` messages
-- `curated_only`: keep only the latest user message (and last assistant if present)
 
 ## Notes
 

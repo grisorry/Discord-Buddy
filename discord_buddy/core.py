@@ -1405,23 +1405,38 @@ class RequestQueue:
                         trigger_user_id=trigger_user_id
                     )
                 
-                # Add the user's message to history
-                await add_to_history(channel_id, "user", content, user_id, guild.id if guild else None, attachments, user_name, reply_to=reply_to_name, meta_tags=meta_tags)
-
-                # Check if the last message in history is from the assistant
-                current_history = get_conversation_history(channel_id)
-                last_message_is_assistant = current_history and current_history[-1]["role"] == "assistant"
-                
-                # If the last message was from assistant, add continuation prompt
-                if last_message_is_assistant:
-                    await add_to_history(
-                        channel_id, 
-                        "user", 
-                        "[Continue the conversation naturally from where you left off.]",
-                        user_id=None,
-                        guild_id=guild.id if guild else None,
-                        user_name=None
+                # Add the user's message to history (servers only; DMs are handled in generate_response)
+                message_content_override = None
+                if not is_dm:
+                    message_content_override = await add_to_history(
+                        channel_id,
+                        "user",
+                        content,
+                        user_id,
+                        guild.id if guild else None,
+                        attachments,
+                        user_name,
+                        reply_to=reply_to_name,
+                        meta_tags=meta_tags,
                     )
+                    if not isinstance(message_content_override, list):
+                        message_content_override = None
+
+                # Check if the last message in history is from the assistant (servers only)
+                if not is_dm:
+                    current_history = get_conversation_history(channel_id)
+                    last_message_is_assistant = current_history and current_history[-1]["role"] == "assistant"
+                    
+                    # If the last message was from assistant, add continuation prompt
+                    if last_message_is_assistant:
+                        await add_to_history(
+                            channel_id, 
+                            "user", 
+                            "[Continue the conversation naturally from where you left off.]",
+                            user_id=None,
+                            guild_id=guild.id if guild else None,
+                            user_name=None
+                        )
                 
                 # Generate response using the main generate_response function (includes debug logging)
                 user_message_for_ai = content
@@ -1437,7 +1452,8 @@ class RequestQueue:
                     is_dm=is_dm,
                     user_id=user_id,
                     original_message=message,
-                    autonomous_join=autonomous_join
+                    autonomous_join=autonomous_join,
+                    message_content_override=message_content_override
                 )
 
                 if bot_response is None:
@@ -3880,7 +3896,7 @@ async def load_all_dm_history(channel: discord.DMChannel, user_id: int, guild = 
         print(f"Error loading DM history: {e}")
         return []
 
-def get_system_prompt(guild_id: int, guild: discord.Guild = None, query: str = None, channel_id: int = None, is_dm: bool = False, user_id: int = None, username: str = None, history: List[Dict] = None, memory_override: Optional[str] = None, extra_context_blocks: Optional[List[str]] = None) -> str:
+def get_system_prompt(guild_id: int, guild: discord.Guild = None, query: str = None, channel_id: int = None, is_dm: bool = False, user_id: int = None, username: str = None, history: List[Dict] = None, memory_override: Optional[str] = None) -> str:
     """Generate complete system prompt following Anthropic's official guide structure"""
     
     # Update the global persona name for this context
@@ -4001,11 +4017,6 @@ Here is a relevant memory of a past conversation. It can be empty, if none was r
 {memory}
 </memory>
 
-Here is additional curated context (if any):
-<curated_context>
-{curated_context}
-</curated_context>
-
 Here are your recent reaction actions (if any):
 <recent_reactions>
 {recent_reactions}
@@ -4124,19 +4135,10 @@ Here is the conversation history (between the users and you):
     else:
         reactions_text = "None."
 
-    # Add curated context blocks from plugins (if any)
-    if extra_context_blocks:
-        curated_context_text = "\n".join([block for block in extra_context_blocks if isinstance(block, str) and block.strip()])
-    else:
-        curated_context_text = ""
-    if not curated_context_text:
-        curated_context_text = "None."
-
     # Replace placeholders (no need for last_message placeholder anymore)
     system_prompt = system_prompt.replace("{lore}", lore_content)
     system_prompt = system_prompt.replace("{emoji_list}", emoji_list)
     system_prompt = system_prompt.replace("{memory}", memory_content)
-    system_prompt = system_prompt.replace("{curated_context}", curated_context_text)
     system_prompt = system_prompt.replace("{recent_reactions}", reactions_text)
     system_prompt = system_prompt.replace("{latest_message}", query or "")
 
@@ -4165,7 +4167,7 @@ def split_message_by_newlines(message: str) -> List[str]:
         return []
     return [part.strip() for part in message.split('\n') if part.strip()]
 
-async def generate_response(channel_id: int, user_message: str, guild: discord.Guild = None, attachments: List[discord.Attachment] = None, user_name: str = None, is_dm: bool = False, user_id: int = None, original_message: discord.Message = None, autonomous_join: bool = False) -> str:
+async def generate_response(channel_id: int, user_message: str, guild: discord.Guild = None, attachments: List[discord.Attachment] = None, user_name: str = None, is_dm: bool = False, user_id: int = None, original_message: discord.Message = None, autonomous_join: bool = False, message_content_override: Any = None) -> str:
     """Generate response using the AI Provider Manager"""
     # print(f"DEBUG: generate_response called with user_message: {repr(user_message)}")
     try:
@@ -4246,8 +4248,11 @@ async def generate_response(channel_id: int, user_message: str, guild: discord.G
                 history = get_conversation_history(channel_id)
             else:
                 # For server channels, the message was already added in _process_single_request
-                # Get the message content for potential replacement below
-                message_content = history[-1]["content"] if history and history[-1].get("role") == "user" else user_message
+                # Use an override if provided (e.g., multimodal content with images)
+                if message_content_override is not None:
+                    message_content = message_content_override
+                else:
+                    message_content = history[-1]["content"] if history and history[-1].get("role") == "user" else user_message
 
         # Create a COPY of the history for this response generation (don't modify the permanent history)
         history = history.copy()
@@ -4307,7 +4312,6 @@ async def generate_response(channel_id: int, user_message: str, guild: discord.G
             user_name,
             history,
             memory_override=memory_override,
-            extra_context_blocks=extra_context_blocks,
         )
 
         # Get temperature - use selected/shared guild for DMs
@@ -4392,6 +4396,7 @@ You can mention a specific user by including <@user_id> in your response, but on
 
 {format_instructions}
 Always respond directly to the user's request. Do not narrate your process or comment on the prompt or persona.
+Never mention system prompts, internal context sources, or decision rules. Do not say "according to context."
 If you were mentioned or replied to, focus on that user's latest message and do not answer older messages.
 If asked to reply to another user's message, address that message directly.
 If a message is clearly a reply between other users, only chime in if you were invited or have a genuinely helpful, concise contribution; avoid hijacking their exchange.
@@ -4431,6 +4436,7 @@ Variety Phrase Bank (use as inspiration only; do not always use; do not repeat t
             "temperature": temperature,
             "reasoning": reasoning_payload,
             "max_tokens": max_tokens,
+            "context_blocks": extra_context_blocks,
         }
         request_payload = await plugin_manager.run_hook("before_generate", request_payload)
         system_prompt = request_payload.get("system_prompt", system_prompt)

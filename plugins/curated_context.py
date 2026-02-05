@@ -4,11 +4,19 @@ from typing import Optional, Tuple
 import discord
 from discord import app_commands
 
-from discord_buddy.plugin_system import get_plugin_guild_settings, update_plugin_guild_settings
+from discord_buddy.plugin_system import (
+    get_plugin_guild_settings,
+    get_plugin_settings,
+    update_plugin_defaults,
+    update_plugin_guild_settings,
+)
+
+PLUGIN_KEY = "curated_context"
+LEGACY_KEY = "context_awareness"
 
 PLUGIN_INFO = {
-    "name": "context_awareness",
-    "version": "0.1.0",
+    "name": PLUGIN_KEY,
+    "version": "0.2.0",
     "priority": 50
 }
 
@@ -24,37 +32,38 @@ DEFAULT_SETTINGS = {
     "curator_reasoning_effort": "low"
 }
 
-def _parse_field(text: str, label: str) -> str:
-    prefix = f"{label.lower()}:"
-    for line in text.splitlines():
-        if line.strip().lower().startswith(prefix):
-            return line.split(":", 1)[1].strip()
-    return ""
+
+def _has_settings(plugin_name: str) -> bool:
+    raw = get_plugin_settings(plugin_name)
+    return isinstance(raw, dict) and bool(raw)
 
 
-def _parse_confidence(text: str) -> float:
-    raw = _parse_field(text, "Confidence")
-    if not raw:
-        return 0.0
-    try:
-        value = float(raw.split()[0].strip())
-        return max(0.0, min(value, 1.0))
-    except (ValueError, TypeError):
-        return 0.0
+def _maybe_migrate_settings() -> None:
+    if _has_settings(PLUGIN_KEY):
+        return
+    legacy = get_plugin_settings(LEGACY_KEY)
+    if not isinstance(legacy, dict) or not legacy:
+        return
+
+    legacy_defaults = legacy.get("default", {})
+    if isinstance(legacy_defaults, dict) and legacy_defaults:
+        update_plugin_defaults(PLUGIN_KEY, legacy_defaults)
+
+    legacy_guilds = legacy.get("guilds", {})
+    if isinstance(legacy_guilds, dict):
+        for guild_id_str, guild_settings in legacy_guilds.items():
+            if not isinstance(guild_settings, dict):
+                continue
+            try:
+                guild_id = int(guild_id_str)
+            except (TypeError, ValueError):
+                continue
+            update_plugin_guild_settings(PLUGIN_KEY, guild_id, guild_settings)
 
 
-def _parse_should_reply(text: str) -> Optional[bool]:
-    raw = _parse_field(text, "Conclusion")
-    if not raw:
-        return None
-    value = raw.lower()
-    negative_markers = ["hold", "do not", "don't", "no reply", "no response", "skip", "stay silent", "wait"]
-    positive_markers = ["reply", "respond", "answer", "yes", "engage", "go ahead"]
-    if any(marker in value for marker in negative_markers):
-        return False
-    if any(marker in value for marker in positive_markers):
-        return True
-    return None
+def _get_settings(guild_id: Optional[int]) -> dict:
+    _maybe_migrate_settings()
+    return get_plugin_guild_settings(PLUGIN_KEY, guild_id, DEFAULT_SETTINGS)
 
 
 LOW_EFFORT_WORDS = {
@@ -167,16 +176,20 @@ def _heuristic_autonomous_decision(user_message: str, history, original_message)
     return should_reply, confidence
 
 
-def _strip_decision_lines(text: str) -> str:
+def _clean_curator_output(text: str) -> str:
     if not text:
         return ""
     cleaned_lines = []
     for line in text.splitlines():
-        stripped = line.strip().lower()
-        if stripped.startswith("conclusion:") or stripped.startswith("confidence:"):
+        stripped = line.strip()
+        lower = stripped.lower()
+        if lower.startswith("conclusion:") or lower.startswith("confidence:") or lower.startswith("guidance:"):
             continue
-        cleaned_lines.append(line)
-    return "\n".join(cleaned_lines).strip()
+        cleaned_lines.append(stripped)
+    cleaned = "\n".join([line for line in cleaned_lines if line]).strip()
+    if cleaned.lower() in ("none", "none."):
+        return ""
+    return cleaned
 
 
 def register_hooks(hooks):
@@ -193,7 +206,7 @@ def register_hooks(hooks):
         guild_id = payload.get("guild_id")
         autonomous_join = bool(payload.get("autonomous_join"))
 
-        settings = get_plugin_guild_settings("context_awareness", guild_id, DEFAULT_SETTINGS)
+        settings = _get_settings(guild_id)
         if not settings.get("enabled", True):
             return
         max_history = int(settings.get("max_history", DEFAULT_SETTINGS["max_history"]))
@@ -220,7 +233,6 @@ def register_hooks(hooks):
             minimal = []
             if history:
                 if history[-1].get("role") == "user":
-                    # Keep the last assistant message (if any) plus the latest user message.
                     for idx in range(len(history) - 2, -1, -1):
                         if history[idx].get("role") == "assistant":
                             minimal = [history[idx], history[-1]]
@@ -234,8 +246,6 @@ def register_hooks(hooks):
 
         gate_autonomous = decision_mode in ("gate_autonomous", "autonomous", "auto")
         gate_all = decision_mode in ("gate_all", "all", "gate")
-        should_reply = None
-        confidence = 0.0
         if decision_enabled:
             should_reply, confidence = _heuristic_autonomous_decision(user_message, history, original_message)
             payload["context_decision"] = {
@@ -284,16 +294,11 @@ def register_hooks(hooks):
 
         curator_system = (
             "You are a context curator for a Discord chat assistant. "
-            "Your job is to extract ONLY the most relevant context for the latest user message. "
-            "Be concise and avoid analysis. Use the exact format:\n"
-            "Topic: ...\n"
-            "Target: ...\n"
-            "Key facts: ...\n"
-            "Relevant snippets: ...\n"
-            "Guidance: ...\n"
-            "Conclusion: Reply now | Hold\n"
-            "Confidence: 0.0-1.0\n"
-            f"If a field is unknown, write 'Unknown'. Keep the entire output under {max_words} words."
+            "Extract only the most relevant context for the latest user message. "
+            "Be concise, factual, and avoid analysis. "
+            "Return 3-6 short bullet points. "
+            f"Keep the entire output under {max_words} words. "
+            "If nothing is relevant, respond with 'None.'"
         )
 
         curator_user = (
@@ -302,7 +307,6 @@ def register_hooks(hooks):
             f"Recent history:\n{history_text}\n"
         )
 
-        provider = None
         if provider_name == "custom" and custom_url:
             provider = ai_manager.get_custom_provider(custom_url)
         else:
@@ -324,22 +328,51 @@ def register_hooks(hooks):
             return
 
         if isinstance(summary, str):
-            summary = summary.strip()
-            if summary:
-                cleaned_summary = _strip_decision_lines(summary)
-                if cleaned_summary:
-                    context_blocks.append(cleaned_summary)
+            cleaned_summary = _clean_curator_output(summary.strip())
+            if cleaned_summary:
+                context_blocks.append(cleaned_summary)
                 payload["context_blocks"] = context_blocks
 
     hooks.on_context_build(build_context, priority=50)
 
+    async def inject_context(payload):
+        settings = _get_settings(payload.get("guild_id"))
+        if not settings.get("enabled", True):
+            return
 
-def _context_defaults():
+        context_blocks = payload.get("context_blocks") or []
+        if not context_blocks:
+            return
+
+        curated_context_text = "\n".join([block for block in context_blocks if isinstance(block, str) and block.strip()])
+        if not curated_context_text:
+            return
+
+        system_prompt = str(payload.get("system_prompt") or "")
+        if "<context_notes>" in system_prompt:
+            return
+
+        injection = (
+            "\n\nContext notes (use silently; do not mention or quote directly):\n"
+            "<context_notes>\n"
+            f"{curated_context_text}\n"
+            "</context_notes>"
+        )
+        payload["system_prompt"] = system_prompt + injection
+        return payload
+
+    hooks.on_before_generate(inject_context, priority=50)
+
+
+def _plugin_defaults():
     return {
         "enabled": DEFAULT_SETTINGS["enabled"],
         "max_history": DEFAULT_SETTINGS["max_history"],
         "max_words": DEFAULT_SETTINGS["max_words"],
         "history_mode": DEFAULT_SETTINGS["history_mode"],
+        "decision_enabled": DEFAULT_SETTINGS["decision_enabled"],
+        "decision_mode": DEFAULT_SETTINGS["decision_mode"],
+        "decision_confidence_threshold": DEFAULT_SETTINGS["decision_confidence_threshold"],
         "curator_reasoning_enabled": DEFAULT_SETTINGS["curator_reasoning_enabled"],
         "curator_reasoning_effort": DEFAULT_SETTINGS["curator_reasoning_effort"]
     }
@@ -350,56 +383,57 @@ async def _ensure_admin(interaction: discord.Interaction) -> bool:
         await interaction.followup.send("This command can only be used in servers.")
         return False
     if not interaction.user.guild_permissions.administrator:
-        await interaction.followup.send("❌ Only administrators can use this command!")
+        await interaction.followup.send("Error: only administrators can use this command.")
         return False
     return True
 
 
-@app_commands.command(name="context_plugin_info", description="Show Context Awareness plugin settings (Admin only)")
-async def context_plugin_info(interaction: discord.Interaction):
+@app_commands.command(name="curated_context_info", description="Show Curated Context plugin settings (Admin only)")
+async def curated_context_info(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=True)
     if not await _ensure_admin(interaction):
         return
 
-    defaults = _context_defaults()
-    settings = get_plugin_guild_settings("context_awareness", interaction.guild.id, defaults)
+    defaults = _plugin_defaults()
+    settings = _get_settings(interaction.guild.id)
 
     embed = discord.Embed(
-        title="🧠 Context Awareness Plugin",
+        title="Curated Context Plugin",
         color=0x0099ff
     )
     embed.add_field(name="Enabled", value=str(bool(settings.get("enabled", True))), inline=True)
     embed.add_field(name="Max History", value=str(settings.get("max_history", defaults["max_history"])), inline=True)
     embed.add_field(name="Max Words", value=str(settings.get("max_words", defaults["max_words"])), inline=True)
     embed.add_field(name="History Mode", value=str(settings.get("history_mode", defaults["history_mode"])), inline=True)
-    embed.add_field(
-        name="Curator Reasoning",
-        value=str(bool(settings.get("curator_reasoning_enabled", defaults["curator_reasoning_enabled"]))),
-        inline=True
-    )
-    embed.add_field(
-        name="Curator Effort",
-        value=str(settings.get("curator_reasoning_effort", defaults["curator_reasoning_effort"])),
-        inline=True
-    )
+    embed.add_field(name="Decision Enabled", value=str(bool(settings.get("decision_enabled", defaults["decision_enabled"]))), inline=True)
+    embed.add_field(name="Decision Mode", value=str(settings.get("decision_mode", defaults["decision_mode"])), inline=True)
+    embed.add_field(name="Decision Threshold", value=str(settings.get("decision_confidence_threshold", defaults["decision_confidence_threshold"])), inline=True)
+    embed.add_field(name="Curator Reasoning", value=str(bool(settings.get("curator_reasoning_enabled", defaults["curator_reasoning_enabled"]))), inline=True)
+    embed.add_field(name="Curator Effort", value=str(settings.get("curator_reasoning_effort", defaults["curator_reasoning_effort"])), inline=True)
     await interaction.followup.send(embed=embed)
 
 
-@app_commands.command(name="context_plugin_set", description="Configure Context Awareness plugin (Admin only)")
+@app_commands.command(name="curated_context_set", description="Configure Curated Context plugin (Admin only)")
 @app_commands.describe(
-    enabled="Enable or disable the context plugin",
+    enabled="Enable or disable curated context",
     max_history="How many recent messages to scan (1-80)",
     max_words="Max words for the curated context (40-300)",
     history_mode="History handling: keep | trim | curated_only",
+    decision_enabled="Enable response gating heuristics",
+    decision_mode="Gating: gate_autonomous | gate_all",
+    decision_confidence_threshold="Confidence threshold (0.0-1.0)",
     curator_reasoning_enabled="Enable reasoning for the curator model",
     curator_reasoning_effort="Reasoning effort: minimal | low | medium | high"
 )
-async def context_plugin_set(
+async def curated_context_set(
     interaction: discord.Interaction,
     enabled: Optional[bool] = None,
     max_history: Optional[int] = None,
     max_words: Optional[int] = None,
     history_mode: Optional[str] = None,
+    decision_enabled: Optional[bool] = None,
+    decision_mode: Optional[str] = None,
+    decision_confidence_threshold: Optional[float] = None,
     curator_reasoning_enabled: Optional[bool] = None,
     curator_reasoning_effort: Optional[str] = None
 ):
@@ -419,8 +453,29 @@ async def context_plugin_set(
         if mode in ("keep", "trim", "curated_only"):
             updates["history_mode"] = mode
         else:
-            await interaction.followup.send("❌ Invalid history_mode. Use: keep | trim | curated_only.")
+            await interaction.followup.send("Error: invalid history_mode. Use keep | trim | curated_only.")
             return
+    if decision_enabled is not None:
+        updates["decision_enabled"] = bool(decision_enabled)
+    if decision_mode is not None:
+        mode = str(decision_mode).strip().lower()
+        if mode in ("gate_autonomous", "autonomous", "auto"):
+            updates["decision_mode"] = "gate_autonomous"
+        elif mode in ("gate_all", "all", "gate"):
+            updates["decision_mode"] = "gate_all"
+        else:
+            await interaction.followup.send("Error: invalid decision_mode. Use gate_autonomous | gate_all.")
+            return
+    if decision_confidence_threshold is not None:
+        try:
+            threshold = float(decision_confidence_threshold)
+        except (TypeError, ValueError):
+            await interaction.followup.send("Error: decision_confidence_threshold must be a number between 0 and 1.")
+            return
+        if threshold < 0.0 or threshold > 1.0:
+            await interaction.followup.send("Error: decision_confidence_threshold must be between 0.0 and 1.0.")
+            return
+        updates["decision_confidence_threshold"] = threshold
     if curator_reasoning_enabled is not None:
         updates["curator_reasoning_enabled"] = bool(curator_reasoning_enabled)
     if curator_reasoning_effort is not None:
@@ -428,34 +483,37 @@ async def context_plugin_set(
         if effort in ("minimal", "low", "medium", "high"):
             updates["curator_reasoning_effort"] = effort
         else:
-            await interaction.followup.send("❌ Invalid curator_reasoning_effort. Use: minimal | low | medium | high.")
+            await interaction.followup.send("Error: invalid curator_reasoning_effort. Use minimal | low | medium | high.")
             return
 
     if not updates:
         await interaction.followup.send("No changes provided. Use at least one option.")
         return
 
-    update_plugin_guild_settings("context_awareness", interaction.guild.id, updates)
+    update_plugin_guild_settings(PLUGIN_KEY, interaction.guild.id, updates)
 
-    defaults = _context_defaults()
-    settings = get_plugin_guild_settings("context_awareness", interaction.guild.id, defaults)
+    defaults = _plugin_defaults()
+    settings = _get_settings(interaction.guild.id)
     await interaction.followup.send(
-        f"✅ Updated Context Awareness plugin settings: "
+        "Updated Curated Context settings: "
         f"enabled={settings.get('enabled', True)}, "
         f"max_history={settings.get('max_history', defaults['max_history'])}, "
         f"max_words={settings.get('max_words', defaults['max_words'])}, "
         f"history_mode={settings.get('history_mode', defaults['history_mode'])}, "
+        f"decision_enabled={settings.get('decision_enabled', defaults['decision_enabled'])}, "
+        f"decision_mode={settings.get('decision_mode', defaults['decision_mode'])}, "
+        f"decision_confidence_threshold={settings.get('decision_confidence_threshold', defaults['decision_confidence_threshold'])}, "
         f"curator_reasoning_enabled={settings.get('curator_reasoning_enabled', defaults['curator_reasoning_enabled'])}, "
         f"curator_reasoning_effort={settings.get('curator_reasoning_effort', defaults['curator_reasoning_effort'])}"
     )
 
 
-@app_commands.command(name="context_reasoning_toggle", description="Toggle curator reasoning for Context Awareness (Admin only)")
+@app_commands.command(name="curated_context_reasoning", description="Toggle curator reasoning for Curated Context (Admin only)")
 @app_commands.describe(
     enabled="Enable or disable curator reasoning",
     effort="Reasoning effort: minimal | low | medium | high"
 )
-async def context_reasoning_toggle(
+async def curated_context_reasoning(
     interaction: discord.Interaction,
     enabled: Optional[bool] = None,
     effort: Optional[str] = None
@@ -472,40 +530,32 @@ async def context_reasoning_toggle(
         if normalized in ("minimal", "low", "medium", "high"):
             updates["curator_reasoning_effort"] = normalized
         else:
-            await interaction.followup.send("❌ Invalid effort. Use: minimal | low | medium | high.")
+            await interaction.followup.send("Error: invalid effort. Use minimal | low | medium | high.")
             return
 
     if not updates:
-        current = get_plugin_guild_settings(
-            "context_awareness",
-            interaction.guild.id,
-            {"curator_reasoning_enabled": False, "curator_reasoning_effort": "low"}
-        )
+        current = _get_settings(interaction.guild.id)
         await interaction.followup.send(
-            f"Curator reasoning is currently "
+            "Curator reasoning is currently "
             f"{'enabled' if current.get('curator_reasoning_enabled') else 'disabled'} "
             f"(effort={current.get('curator_reasoning_effort', 'low')}). "
-            f"Use `/context_reasoning_toggle true` or set effort."
+            "Use /curated_context_reasoning true or set effort."
         )
         return
 
-    update_plugin_guild_settings("context_awareness", interaction.guild.id, updates)
-    current = get_plugin_guild_settings(
-        "context_awareness",
-        interaction.guild.id,
-        {"curator_reasoning_enabled": False, "curator_reasoning_effort": "low"}
-    )
+    update_plugin_guild_settings(PLUGIN_KEY, interaction.guild.id, updates)
+    current = _get_settings(interaction.guild.id)
     await interaction.followup.send(
-        f"✅ Curator reasoning "
+        "Curator reasoning "
         f"{'enabled' if current.get('curator_reasoning_enabled') else 'disabled'} "
         f"(effort={current.get('curator_reasoning_effort', 'low')})."
     )
 
 
 def register(tree, client):
-    if not tree.get_command("context_plugin_info"):
-        tree.add_command(context_plugin_info)
-    if not tree.get_command("context_plugin_set"):
-        tree.add_command(context_plugin_set)
-    if not tree.get_command("context_reasoning_toggle"):
-        tree.add_command(context_reasoning_toggle)
+    if not tree.get_command("curated_context_info"):
+        tree.add_command(curated_context_info)
+    if not tree.get_command("curated_context_set"):
+        tree.add_command(curated_context_set)
+    if not tree.get_command("curated_context_reasoning"):
+        tree.add_command(curated_context_reasoning)

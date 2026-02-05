@@ -225,7 +225,7 @@ class EventsCog(commands.Cog):
         if message.author == client.user:
             should_respond = False
         # Respond to mentions, DMs, voice messages (but NOT @here or @everyone)
-        elif (client.user.mentioned_in(message) and not message.mention_everyone) or is_dm or voice_text or is_reply_to_bot:
+        elif (client.user.mentioned_in(message) and not message.mention_everyone) or is_dm or voice_message_detected or is_reply_to_bot:
             should_respond = True
             direct_trigger = True
         # Autonomous responses (with explicit protection against own messages)
