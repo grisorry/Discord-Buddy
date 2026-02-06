@@ -182,3 +182,4 @@ cython_debug/
 bot_data/
 templates/
 character_extractor/
+plugins/dnd_toolkit.py
